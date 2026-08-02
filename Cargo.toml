@@ -1,5 +1,5 @@
 [package]
-name = "opencode-proxy"
+name = "opencode-api-proxy"
 version = "1.0.0"
 edition = "2021"
 

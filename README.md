@@ -1,4 +1,4 @@
-# OpenCode-Free-Proxy
+# OpenCode-API-Proxy
 
 Ultra-fast, lightweight, transparent proxy written in Rust (`hyper` + `tokio`). It provides access to OpenCode's free AI models by offering fully compatible OpenAI (`/v1/chat/completions`) and Anthropic (`/v1/messages`) endpoints.
 
@@ -34,8 +34,8 @@ Uses `webpki-roots` (no OpenSSL runtime dependency required). Written in low-lev
 Download the latest release or clone the repository and compile it yourself using Rust.
 
 ```bash
-git clone https://github.com/your-username/opencode-free-proxy.git
-cd opencode-free-proxy
+git clone https://github.com/your-username/opencode-api-proxy.git
+cd opencode-api-proxy
 
 cargo run --release
 ```
@@ -77,14 +77,14 @@ WantedBy=multi-user.target
 EOF
 
 sudo systemctl daemon-reload
-sudo systemctl enable --now opencode-free-proxy
+sudo systemctl enable --now opencode-api-proxy
 ```
 
 Check status and view logs:
 
 ```bash
-systemctl status opencode-free-proxy
-journalctl -u opencode-free-proxy -f
+systemctl status opencode-api-proxy
+journalctl -u opencode-api-proxy -f
 ```
 
 </details>

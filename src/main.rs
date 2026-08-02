@@ -6,7 +6,7 @@ use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use rand::{distributions::Alphanumeric, Rng};
 use serde_json::{json, Value};
-use std::{collections::HashMap, fs, sync::Arc, time::{Duration, SystemTime, UNIX_EPOCH}};
+use std::{collections::HashMap, env, fs, sync::Arc, time::{Duration, SystemTime, UNIX_EPOCH}};
 use tokio::sync::{Notify, RwLock};
 use tokio_stream::wrappers::ReceiverStream;
 
@@ -21,10 +21,41 @@ struct State {
         hyper_rustls::HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>,
         BoxBody<Bytes, Err>,
     >,
-    keys: HashMap<String, String>,
+    enable_auth: bool,
+    api_key: String,
     sessions: RwLock<HashMap<String, (String, u64)>>,
     models: RwLock<Vec<String>>,
     notify: Notify,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Config {
+    enable_auth: bool,
+    api_key: String,
+}
+
+fn load_config() -> Config {
+    let path = env::var("CONFIG_FILE").unwrap_or_else(|_| "./config.json".into());
+
+    let env_auth = env::var("ENABLE_AUTH").ok().map(|v| v.eq_ignore_ascii_case("true") || v == "1");
+    let env_key = env::var("API_KEY").ok();
+
+    if let Ok(data) = fs::read_to_string(&path) {
+        let mut cfg: Config = serde_json::from_str(&data).unwrap_or_else(|_| Config {
+            enable_auth: env_auth.unwrap_or(false),
+            api_key: env_key.clone().unwrap_or_else(|| format!("oc-{}", oc_id("key"))),
+        });
+        if let Some(a) = env_auth { cfg.enable_auth = a; }
+        if let Some(k) = env_key { cfg.api_key = k; }
+        cfg
+    } else {
+        let cfg = Config {
+            enable_auth: env_auth.unwrap_or(false),
+            api_key: env_key.unwrap_or_else(|| format!("oc-{}", oc_id("key"))),
+        };
+        let _ = fs::write(&path, serde_json::to_string_pretty(&cfg).unwrap());
+        cfg
+    }
 }
 
 fn oc_id(prefix: &str) -> String {
@@ -33,24 +64,19 @@ fn oc_id(prefix: &str) -> String {
     format!("{}_{:x}{}", prefix, ts, rnd)
 }
 
-fn load_keys() -> HashMap<String, String> {
-    let path = std::env::var("KEYS_FILE").unwrap_or_else(|_| "./api-keys.json".into());
-    if let Ok(data) = fs::read_to_string(&path) {
-        if let Ok(map) = serde_json::from_str(&data) { return map; }
+fn auth(state: &State, req: &Request<Incoming>) -> bool {
+    if !state.enable_auth {
+        return true;
     }
-    let mut map = HashMap::new();
-    map.insert("admin".into(), format!("oc-{}", oc_id("key")));
-    map.insert("user-default".into(), format!("oc-{}", oc_id("key")));
-    let _ = fs::write(path, serde_json::to_string_pretty(&map).unwrap());
-    map
-}
-
-fn auth(state: &State, req: &Request<Incoming>) -> Option<String> {
     let tok = req.headers().get(AUTHORIZATION)
         .and_then(|h| h.to_str().ok())
         .map(|s| s.strip_prefix("Bearer ").unwrap_or(s))
-        .or_else(|| req.headers().get("x-api-key").and_then(|h| h.to_str().ok()))?;
-    state.keys.iter().find(|(_, k)| *k == tok).map(|(u, _)| u.clone())
+        .or_else(|| req.headers().get("x-api-key").and_then(|h| h.to_str().ok()));
+
+    match tok {
+        Some(t) => t == state.api_key,
+        None => false,
+    }
 }
 
 async fn get_session(state: &State, user: &str) -> String {
@@ -159,10 +185,9 @@ async fn router(req: Request<Incoming>, state: Arc<State>) -> Result<BoxRes, Err
 }
 
 async fn handle_openai(req: Request<Incoming>, state: Arc<State>) -> Result<BoxRes, Err> {
-    let user = match auth(&state, &req) {
-        Some(u) => u,
-        None => return Ok(json_res(StatusCode::UNAUTHORIZED, json!({"error": {"message": "Invalid API key"}}))),
-    };
+    if !auth(&state, &req) {
+        return Ok(json_res(StatusCode::UNAUTHORIZED, json!({"error": {"message": "Invalid API key"}})));
+    }
 
     let limited_body = Limited::new(req.into_body(), MAX_BODY_SIZE);
     let body_bytes = match limited_body.collect().await {
@@ -182,7 +207,7 @@ async fn handle_openai(req: Request<Incoming>, state: Arc<State>) -> Result<BoxR
     }
 
     let stream = body_json["stream"].as_bool().unwrap_or(false);
-    let session_id = get_session(&state, &user).await;
+    let session_id = get_session(&state, "default").await;
 
     let upstream_req = Request::builder()
         .method(Method::POST)
@@ -213,10 +238,12 @@ async fn handle_openai(req: Request<Incoming>, state: Arc<State>) -> Result<BoxR
 }
 
 async fn handle_anthropic(req: Request<Incoming>, state: Arc<State>) -> Result<BoxRes, Err> {
-    let user = match auth(&state, &req) {
-        Some(u) => u,
-        None => return Ok(json_res(StatusCode::UNAUTHORIZED, json!({"type": "error", "error": {"type": "authentication_error", "message": "Invalid API key"}}))),
-    };
+    if !auth(&state, &req) {
+        return Ok(json_res(StatusCode::UNAUTHORIZED, json!({
+            "type": "error",
+            "error": { "type": "authentication_error", "message": "Invalid API key" }
+        })));
+    }
 
     let limited_body = Limited::new(req.into_body(), MAX_BODY_SIZE);
     let body_bytes = match limited_body.collect().await {
@@ -288,7 +315,7 @@ async fn handle_anthropic(req: Request<Incoming>, state: Arc<State>) -> Result<B
     }
 
     let stream = ant_body["stream"].as_bool().unwrap_or(false);
-    let session_id = get_session(&state, &user).await;
+    let session_id = get_session(&state, "default").await;
 
     let mut req_payload = json!({ "model": model, "messages": oai_msgs, "stream": stream });
     if !oai_tools.is_empty() { req_payload["tools"] = json!(oai_tools); }
@@ -451,8 +478,12 @@ async fn handle_anthropic(req: Request<Incoming>, state: Arc<State>) -> Result<B
 
 #[tokio::main]
 async fn main() -> Result<(), Err> {
-    let port = std::env::var("PORT").unwrap_or_else(|_| "6446".into());
+    let port = env::var("PORT")
+        .or_else(|_| env::var("PROXY_PORT"))
+        .unwrap_or_else(|_| "6446".into());
     let addr = format!("0.0.0.0:{port}");
+
+    let config = load_config();
 
     let https = hyper_rustls::HttpsConnectorBuilder::new()
         .with_webpki_roots()
@@ -467,16 +498,24 @@ async fn main() -> Result<(), Err> {
 
     let state = Arc::new(State {
         client,
-        keys: load_keys(),
+        enable_auth: config.enable_auth,
+        api_key: config.api_key,
         sessions: RwLock::new(HashMap::new()),
         models: RwLock::new(Vec::new()),
         notify: Notify::new(),
     });
 
+
     let state_clone = Arc::clone(&state);
     tokio::spawn(async move {
         let _ = fetch_models(&state_clone).await;
     });
+
+    if config.enable_auth {
+        println!("Auth ENABLED. Use the config.json API Key or the API_KEY environment variable if provided.");
+    } else {
+        println!("Auth DISABLED. No API Key is required.");
+    }
 
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     println!("Proxy listening on http://{}", addr);

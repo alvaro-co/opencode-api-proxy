@@ -23,7 +23,7 @@ Uses `webpki-roots` (no OpenSSL runtime dependency required). Written in low-lev
 - **Zero-Copy Streaming:** Fast passthrough for OpenAI format with zero memory re-encoding.
 - **Real-Time Anthropic SSE Streaming:** Translates upstream OpenAI streams to Anthropic format on the fly with proper tool calling index tracking and backpressure handling.
 - **Production Ready:** Built-in 10MB body payload protection, automatic 30-minute session rotation per user, and `tcp_nodelay` socket tuning.
-- **Self-Generating API Keys:** Creates and persists `api-keys.json` on first run if no key file exists.
+- **Self-Generating Config:** Creates and persists `config.json` on first run if no config file exists.
 
 ---
 
@@ -40,7 +40,7 @@ cd opencode-api-proxy
 cargo run --release
 ```
 
-The server runs by default on port `6446` (configurable via `PORT`). On first launch, it outputs the generated API keys to stdout and writes them to `./api-keys.json`.
+The server runs by default on port `6446` (configurable via `PORT`). On first launch, it outputs the (optional) generated API key to stdout and write it to `./config.json`.
 
 ```
 Proxy listening on http://0.0.0.0:6446
@@ -50,8 +50,10 @@ Proxy listening on http://0.0.0.0:6446
 
 | Variable | Default | Description |
 | :--- | :--- | :--- |
-| `PROXY_PORT` | `6446` | Port for the HTTP server to listen on. |
-| `KEYS_FILE` | `./api-keys.json` | Path to the JSON file containing valid API keys. |
+| `PORT` | `6446` | Port for the HTTP server to listen on. |
+| `ENABLE_AUTH` | `false` | Set to `true` to require an API key for requests. |
+| `API_KEY` | `oc-secret-key` | The single valid API key if `ENABLE_AUTH=true`. |
+| `CONFIG_FILE` | `./config.json` | Path to the JSON file containing the API key and auth config. |
 
 ---
 
@@ -68,8 +70,8 @@ After=network-online.target
 
 [Service]
 ExecStart=/usr/local/bin/opencode-api-proxy
-Environment=PROXY_PORT=6446
-Environment=KEYS_FILE=/etc/opencode-api-proxy/api-keys.json
+Environment=PORT=6446
+Environment=CONFIG_FILE=/etc/opencode-api-proxy/config.json
 Restart=always
 
 [Install]

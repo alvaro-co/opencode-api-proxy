@@ -16,10 +16,8 @@ pub async fn handle_messages(req: Request<hyper::body::Incoming>, state: Arc<Sta
     }
 
     let body_bytes = match read_body(req).await {
-        Ok(b) => b,
-        Err(_) => {
-            return Ok(anthropic_error(StatusCode::PAYLOAD_TOO_LARGE, "invalid_request_error", "Payload too large"))
-        }
+        crate::common::BodyRead::Data(b) => b,
+        crate::common::BodyRead::Respond(r) => return Ok(r),
     };
     let ant_body: Value = match serde_json::from_slice(&body_bytes) {
         Ok(v) => v,

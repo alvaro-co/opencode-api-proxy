@@ -78,12 +78,20 @@ pub fn anthropic_error(status: StatusCode, err_type: &str, message: impl Into<St
     )
 }
 
-pub async fn read_body(req: Request<Incoming>) -> Result<Bytes, BoxRes> {
+pub enum BodyRead {
+    Data(Bytes),
+    Respond(BoxRes),
+}
+
+pub async fn read_body(req: Request<Incoming>) -> BodyRead {
     let limited = Limited::new(req.into_body(), MAX_BODY_SIZE);
     match tokio::time::timeout(Duration::from_secs(60), limited.collect()).await {
-        Ok(Ok(b)) => Ok(b.to_bytes()),
-        Ok(Err(_)) => Err(error_res(StatusCode::PAYLOAD_TOO_LARGE, "Payload too large")),
-        Err(_) => Err(error_res(
+        Ok(Ok(b)) => BodyRead::Data(b.to_bytes()),
+        Ok(Err(_)) => BodyRead::Respond(error_res(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "Payload too large",
+        )),
+        Err(_) => BodyRead::Respond(error_res(
             StatusCode::REQUEST_TIMEOUT,
             "Timed out reading request body",
         )),

@@ -21,8 +21,8 @@ pub async fn handle_chat_completions(req: Request<hyper::body::Incoming>, state:
     }
 
     let body_bytes = match read_body(req).await {
-        Ok(b) => b,
-        Err(r) => return Ok(r),
+        crate::common::BodyRead::Data(b) => b,
+        crate::common::BodyRead::Respond(r) => return Ok(r),
     };
     let body_json: Value = match serde_json::from_slice(&body_bytes) {
         Ok(v) => v,
@@ -58,8 +58,8 @@ pub async fn handle_responses(req: Request<hyper::body::Incoming>, state: Arc<St
     }
 
     let body_bytes = match read_body(req).await {
-        Ok(b) => b,
-        Err(r) => return Ok(r),
+        crate::common::BodyRead::Data(b) => b,
+        crate::common::BodyRead::Respond(r) => return Ok(r),
     };
     let body: Value = match serde_json::from_slice(&body_bytes) {
         Ok(v) => v,

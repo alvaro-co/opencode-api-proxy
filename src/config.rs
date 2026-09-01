@@ -7,6 +7,8 @@ pub struct Config {
     pub enable_auth: bool,
     pub api_key: String,
     pub generated: bool,
+    pub kilo_token: String,
+    pub kilo_enabled: bool,
 }
 
 pub fn default_path() -> String {
@@ -26,6 +28,8 @@ pub fn read_file(path: &str) -> Option<Config> {
         enable_auth: val["enable_auth"].as_bool().unwrap_or(false),
         api_key: val["api_key"].as_str().unwrap_or("").to_string(),
         generated: false,
+        kilo_token: val["kilo_token"].as_str().unwrap_or("anonymous").to_string(),
+        kilo_enabled: val.get("kilo_enabled").and_then(|v| v.as_bool()).unwrap_or(true),
     })
 }
 
@@ -38,6 +42,8 @@ pub fn write_file(path: &str, cfg: &Config) -> Result<(), String> {
     let body = json!({
         "enable_auth": cfg.enable_auth,
         "api_key": cfg.api_key,
+        "kilo_token": cfg.kilo_token,
+        "kilo_enabled": cfg.kilo_enabled,
     });
     fs::write(path, format!("{}\n", serde_json::to_string_pretty(&body).unwrap()))
         .map_err(|e| e.to_string())?;
@@ -58,6 +64,13 @@ pub struct Cli {
     pub api_key: Option<String>,
     pub config_path: Option<String>,
     pub enforce_config: bool,
+    pub kilo_token: Option<String>,
+    pub kilo_upstream: Option<String>,
+    pub no_kilo: bool,
+    pub proxies: Vec<String>,
+    pub proxy_file: Option<String>,
+    pub proxy_url: Option<String>,
+    pub proxy_interval: Option<u64>,
     pub help: bool,
     pub version: bool,
 }
@@ -76,6 +89,13 @@ Options:
       --enforce-config    Load the config file and (re)write it with the effective
                           settings; creates it if missing. Without this flag the
                           file is only read if present and never modified.
+      --kilo-token <TOKEN> Kilo auth token [default: anonymous] [env: KILO_TOKEN]
+      --kilo-upstream <URL> Kilo upstream base [default: https://api.kilo.ai/api/openrouter] [env: KILO_UPSTREAM]
+      --no-kilo           Disable Kilo provider (opencode only)
+      --proxy <URL>       Add HTTP proxy for upstream (repeatable, e.g. http://ip:port or ip:port:user:pass)
+      --proxy-file <FILE> Load proxies from file (one per line, # for comments)
+      --proxy-url <URL>   Load proxies from URL
+      --proxy-interval <SECS> Proxy rotation interval [default: 900, min 60]
   -h, --help              Print this help
   -V, --version           Print version
 
@@ -88,10 +108,13 @@ Environment variables:
   API_KEY=<key>           Use a fixed API key
   CONFIG_FILE=path        Config file location
   OPENCODE_UPSTREAM=url   Override upstream API base (default: https://opencode.ai/zen/v1)
+  KILO_TOKEN=token        Kilo auth token
+  KILO_UPSTREAM=url       Kilo upstream base
+  KILO_ENABLED=true|false Enable/disable Kilo (default true)
 
 Endpoints:
   GET  /health                 Liveness + version + auth mode
-  GET  /v1/models              List free models
+  GET  /v1/models              List free models (merged OpenCode + Kilo)
   POST /v1/chat/completions    OpenAI Chat Completions (stream + tools)
   POST /v1/responses           OpenAI Responses API (stream + tools)
   POST /v1/messages            Anthropic Messages (stream + tools)
@@ -130,6 +153,16 @@ pub fn parse_args() -> Result<Cli, String> {
             "-k" | "--api-key" => cli.api_key = Some(value!("--api-key")?),
             "-c" | "--config" => cli.config_path = Some(value!("--config")?),
             "--enforce-config" => cli.enforce_config = true,
+            "--kilo-token" => cli.kilo_token = Some(value!("--kilo-token")?),
+            "--kilo-upstream" => cli.kilo_upstream = Some(value!("--kilo-upstream")?),
+            "--no-kilo" => cli.no_kilo = true,
+            "--proxy" => cli.proxies.push(value!("--proxy")?),
+            "--proxy-file" => cli.proxy_file = Some(value!("--proxy-file")?),
+            "--proxy-url" => cli.proxy_url = Some(value!("--proxy-url")?),
+            "--proxy-interval" => {
+                let v: u64 = value!("--proxy-interval")?.parse().map_err(|_| "invalid --proxy-interval")?;
+                cli.proxy_interval = Some(v);
+            }
             "-h" | "--help" => cli.help = true,
             "-V" | "--version" => cli.version = true,
             other => return Err(format!("unknown argument: {other} (see --help)")),
@@ -180,6 +213,32 @@ pub fn resolve(cli: &Cli) -> (Config, Option<String>) {
     }
     if cli.auth_flag || cli.api_key.is_some() {
         cfg.enable_auth = true;
+    }
+
+    if let Ok(t) = env::var("KILO_TOKEN").or_else(|_| env::var("KILO_AUTH_TOKEN")) {
+        if !t.is_empty() {
+            cfg.kilo_token = t;
+        }
+    }
+    if let Ok(v) = env::var("KILO_ENABLED") {
+        cfg.kilo_enabled = !(v.eq_ignore_ascii_case("false") || v == "0");
+    }
+    if let Some(t) = &cli.kilo_token {
+        cfg.kilo_token = t.clone();
+    }
+    if cli.no_kilo {
+        cfg.kilo_enabled = false;
+    }
+    if cfg.kilo_token.is_empty() {
+        cfg.kilo_token = "anonymous".to_string();
+    }
+    if cli.kilo_upstream.is_some() {
+        let v = cli.kilo_upstream.clone().unwrap();
+        std::env::set_var("KILO_UPSTREAM", v);
+        std::env::set_var("KILO_BASE", std::env::var("KILO_UPSTREAM").unwrap());
+    } else if let Ok(v) = env::var("KILO_UPSTREAM").or_else(|_| env::var("KILO_BASE")) {
+        std::env::set_var("KILO_UPSTREAM", v.clone());
+        std::env::set_var("KILO_BASE", v);
     }
 
     (cfg, file_cfg.map(|_| path))

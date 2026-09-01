@@ -3,6 +3,7 @@ mod common;
 mod config;
 mod models;
 mod openai;
+mod rotator;
 
 use common::{auth, error_res, json_res, BoxRes, Err, State};
 use config::Config;
@@ -18,13 +19,22 @@ async fn router(req: Request<Incoming>, state: Arc<State>, peer: String) -> Resu
     match (req.method(), req.uri().path()) {
         (&Method::GET, "/health") | (&Method::HEAD, "/health") => {
             let models_cnt = state.models.read().len();
+            let opencode_cnt = state.opencode_models.read().len();
+            let kilo_cnt = state.kilo_models.read().len();
+            let rotator_status = state.rotator.as_ref().map(|r| r.status());
             Ok(json_res(
                 StatusCode::OK,
                 json!({
                     "status": "ok",
                     "version": state.version(),
                     "auth": state.enable_auth,
-                    "models": models_cnt
+                    "models": models_cnt,
+                    "providers": {
+                        "opencode": opencode_cnt,
+                        "kilo": kilo_cnt,
+                        "kilo_enabled": state.kilo_enabled
+                    },
+                    "proxy_rotator": rotator_status
                 }),
             ))
         }
@@ -57,7 +67,7 @@ async fn router(req: Request<Incoming>, state: Arc<State>, peer: String) -> Resu
     }
 }
 
-fn print_banner(addr: &str, cfg: &Config, config_line: Option<&str>) {
+fn print_banner(addr: &str, cfg: &Config, config_line: Option<&str>, rotator: &Option<Arc<rotator::ProxyRotator>>) {
     println!("opencode-api-proxy v{}", env!("CARGO_PKG_VERSION"));
     println!("  URL    http://{addr}");
     if cfg.enable_auth {
@@ -65,6 +75,17 @@ fn print_banner(addr: &str, cfg: &Config, config_line: Option<&str>) {
         println!("  Auth   Bearer {}{tag}", cfg.api_key);
     } else {
         println!("  Auth   none required");
+    }
+    if cfg.kilo_enabled {
+        let token_display = if cfg.kilo_token == "anonymous" { "anonymous".to_string() } else { format!("{}...", &cfg.kilo_token[..8.min(cfg.kilo_token.len())]) };
+        println!("  Kilo   enabled (token: {token_display})");
+    } else {
+        println!("  Kilo   disabled");
+    }
+    if let Some(r) = rotator {
+        if r.is_enabled() {
+            println!("  Proxy  {} proxies (interval {}s)", r.count(), r.interval().as_secs());
+        }
     }
     if let Some(line) = config_line {
         println!("  Config {line}");
@@ -109,12 +130,37 @@ async fn main() -> Result<(), Err> {
         }
     }
 
+    let rotator: Option<Arc<rotator::ProxyRotator>> = {
+        let interval = Duration::from_secs(cli.proxy_interval.unwrap_or(900).max(60));
+        let initial_proxies = cli.proxies.clone();
+        let r = rotator::ProxyRotator::new(initial_proxies, interval);
+        if let Some(path) = &cli.proxy_file {
+            match r.load_from_file(path) {
+                Ok(n) => println!("  Proxy  loaded {n} proxies from file {path}"),
+                Err(e) => eprintln!("warning: proxy file {path}: {e}"),
+            }
+        }
+        if let Some(url) = &cli.proxy_url {
+            match r.load_from_url(url).await {
+                Ok(n) => println!("  Proxy  loaded {n} proxies from url {url}"),
+                Err(e) => eprintln!("warning: proxy url {url}: {e}"),
+            }
+        }
+        if r.count() > 0 {
+            r.clone().spawn_background_task();
+            Some(r)
+        } else {
+            None
+        }
+    };
+
     let addr = format!("{host}:{port}");
 
     let mut http = hyper_util::client::legacy::connect::HttpConnector::new();
     http.set_connect_timeout(Some(Duration::from_secs(10)));
     http.set_nodelay(true);
     http.set_keepalive(Some(Duration::from_secs(75)));
+    http.enforce_http(false);
 
     let https = hyper_rustls::HttpsConnectorBuilder::new()
         .with_webpki_roots()
@@ -134,13 +180,18 @@ async fn main() -> Result<(), Err> {
         api_key: cfg.api_key.clone(),
         sessions: RwLock::new(HashMap::new()),
         models: RwLock::new(Arc::new(Vec::new())),
+        opencode_models: RwLock::new(Arc::new(Vec::new())),
+        kilo_models: RwLock::new(Arc::new(Vec::new())),
         notify: Notify::new(),
+        kilo_token: cfg.kilo_token.clone(),
+        kilo_enabled: cfg.kilo_enabled,
+        rotator: rotator.clone(),
     });
 
     models::spawn_refresher(Arc::clone(&state));
 
     let listener = tokio::net::TcpListener::bind(&addr).await?;
-    print_banner(&addr, &cfg, config_line.as_deref());
+    print_banner(&addr, &cfg, config_line.as_deref(), &rotator);
 
     let auto_server = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new());
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::mpsc::channel::<()>(1);

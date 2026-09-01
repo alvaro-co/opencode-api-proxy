@@ -1,4 +1,6 @@
 {
   "enable_auth": false,
-  "api_key": ""
+  "api_key": "",
+  "kilo_token": "anonymous",
+  "kilo_enabled": true
 }

@@ -50,6 +50,16 @@ function Install-Update {
     try {
         New-Item -ItemType Directory -Force -Path $Tmp | Out-Null
         Invoke-WebRequest -Uri $Url -OutFile (Join-Path $Tmp $Asset) -UseBasicParsing
+        try {
+            Invoke-WebRequest -Uri "$Url.sha256" -OutFile (Join-Path $Tmp "checksum") -UseBasicParsing -ErrorAction Stop
+            $Want = (((Get-Content (Join-Path $Tmp "checksum") -TotalCount 1) -split '\s+')[0]).ToLower()
+            $Got = ((Get-FileHash -Algorithm SHA256 -Path (Join-Path $Tmp $Asset)).Hash).ToLower()
+            if ($Got -ne $Want) { throw "checksum mismatch for $Asset" }
+            Log "info" "checksum verified"
+        } catch {
+            if ($_.Exception.Message -match "checksum mismatch") { throw }
+            Log "warn" "checksum unavailable, skipping verification"
+        }
         Expand-Archive -Path (Join-Path $Tmp $Asset) -DestinationPath $Tmp -Force
         $Src = Get-ChildItem -Path $Tmp -Filter "opencode-api-proxy.exe" -Recurse | Select-Object -First 1
         if (-not $Src) { Log "error" "binary not found in archive"; return $false }

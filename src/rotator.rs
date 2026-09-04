@@ -13,7 +13,11 @@ pub struct ProxyRotator {
 
 impl ProxyRotator {
     pub fn new(proxies: Vec<String>, interval: Duration) -> Arc<Self> {
-        let normalized: Vec<String> = proxies.into_iter().map(|p| Self::normalize_proxy(&p)).collect();
+        let normalized: Vec<String> = proxies
+            .into_iter()
+            .map(|p| Self::normalize_proxy(&p))
+            .filter(|p| !p.is_empty())
+            .collect();
         let rotator = Arc::new(Self {
             proxies: RwLock::new(normalized),
             current_index: AtomicUsize::new(0),
@@ -29,16 +33,6 @@ impl ProxyRotator {
 
     pub fn is_enabled(&self) -> bool {
         self.enabled.load(Ordering::Relaxed) && !self.proxies.read().is_empty()
-    }
-
-    #[allow(dead_code)]
-    pub fn set_enabled(&self, enabled: bool) {
-        self.enabled.store(enabled, Ordering::Relaxed);
-    }
-
-    #[allow(dead_code)]
-    pub fn set_interval(&self, interval: Duration) {
-        *self.interval.write() = interval.max(Duration::from_secs(60));
     }
 
     pub fn interval(&self) -> Duration {
@@ -71,18 +65,27 @@ impl ProxyRotator {
     }
 
     pub fn shuffle_now(&self) -> Option<String> {
-        if self.proxies.read().is_empty() {
+        let len = self.proxies.read().len();
+        if len == 0 {
             return None;
         }
-        let len = self.proxies.read().len();
-        let next = (self.current_index.load(Ordering::Relaxed) + 1) % len;
-        self.current_index.store(next, Ordering::Relaxed);
+        if len > 1 {
+            let cur = self.current_index.load(Ordering::Relaxed) % len;
+            let mut next = fastrand::usize(0..len);
+            if next == cur {
+                next = (next + 1) % len;
+            }
+            self.current_index.store(next, Ordering::Relaxed);
+        }
         *self.last_shuffle.write() = Instant::now();
         self.get_current_proxy()
     }
 
     pub fn add_proxy(&self, proxy: String) -> bool {
         let normalized = Self::normalize_proxy(&proxy);
+        if normalized.is_empty() {
+            return false;
+        }
         let mut proxies = self.proxies.write();
         if proxies.contains(&normalized) {
             return false;
@@ -118,31 +121,28 @@ impl ProxyRotator {
 
     async fn fetch_url(url: &str) -> Result<String, String> {
         use hyper::Request;
-        use hyper_util::client::legacy::connect::HttpConnector;
-        use hyper_rustls::HttpsConnectorBuilder;
         use hyper_util::rt::TokioExecutor;
-        use http_body_util::BodyExt;
+        use http_body_util::{BodyExt, Limited};
 
-        let mut http = HttpConnector::new();
-        http.set_connect_timeout(Some(Duration::from_secs(10)));
-        http.enforce_http(false);
-        let https = HttpsConnectorBuilder::new()
-            .with_webpki_roots()
-            .https_or_http()
-            .enable_http1()
-            .enable_http2()
-            .wrap_connector(http);
+        let https = crate::common::build_https_connector();
         let client = hyper_util::client::legacy::Client::builder(TokioExecutor::new()).build(https);
         let req = Request::builder()
             .method(hyper::Method::GET)
             .uri(url)
             .body(crate::common::full_body(bytes::Bytes::new()))
             .map_err(|e| e.to_string())?;
-        let res = client.request(req).await.map_err(|e| e.to_string())?;
+        let res = tokio::time::timeout(Duration::from_secs(30), client.request(req))
+            .await
+            .map_err(|_| "proxy list fetch timed out".to_string())?
+            .map_err(|e| e.to_string())?;
         if !res.status().is_success() {
             return Err(format!("HTTP {}", res.status()));
         }
-        let body = res.into_body().collect().await.map_err(|e| e.to_string())?.to_bytes();
+        let body = Limited::new(res.into_body(), 1024 * 1024)
+            .collect()
+            .await
+            .map_err(|e| e.to_string())?
+            .to_bytes();
         String::from_utf8(body.to_vec()).map_err(|e| e.to_string())
     }
 
@@ -177,13 +177,18 @@ impl ProxyRotator {
         }
     }
 
-    #[allow(dead_code)]
-    pub fn list(&self) -> Vec<String> {
-        self.proxies.read().clone()
-    }
-
     pub fn count(&self) -> usize {
         self.proxies.read().len()
+    }
+
+    fn redact_proxy(proxy: &str) -> String {
+        match proxy.rfind('@') {
+            Some(at) => match proxy[..at].rfind("//") {
+                Some(slash) => format!("{}//***@{}", &proxy[..slash], &proxy[at + 1..]),
+                None => format!("***@{}", &proxy[at + 1..]),
+            },
+            None => proxy.to_string(),
+        }
     }
 
     pub fn status(&self) -> serde_json::Value {
@@ -192,7 +197,7 @@ impl ProxyRotator {
             "interval_secs": self.interval().as_secs(),
             "proxy_count": self.count(),
             "current_index": self.current_index.load(Ordering::Relaxed),
-            "current_proxy": self.get_current_proxy(),
+            "current_proxy": self.get_current_proxy().as_deref().map(Self::redact_proxy),
             "last_shuffle_secs": self.last_shuffle.read().elapsed().as_secs()
         })
     }

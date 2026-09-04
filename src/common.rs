@@ -27,27 +27,6 @@ pub static JSON_HEADER: HeaderValue = HeaderValue::from_static("application/json
 pub const UPSTREAM_BASE_DEFAULT: &str = "https://opencode.ai/zen/v1";
 pub const KILO_BASE_DEFAULT: &str = "https://api.kilo.ai/api/openrouter";
 
-static UPSTREAM_BASE_CACHE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-static KILO_BASE_CACHE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-
-pub fn upstream_base() -> String {
-    UPSTREAM_BASE_CACHE
-        .get_or_init(|| {
-            std::env::var("OPENCODE_UPSTREAM").unwrap_or_else(|_| UPSTREAM_BASE_DEFAULT.to_string())
-        })
-        .clone()
-}
-
-pub fn kilo_base() -> String {
-    KILO_BASE_CACHE
-        .get_or_init(|| {
-            std::env::var("KILO_UPSTREAM")
-                .or_else(|_| std::env::var("KILO_BASE"))
-                .unwrap_or_else(|_| KILO_BASE_DEFAULT.to_string())
-        })
-        .clone()
-}
-
 pub struct State {
     pub client: hyper_util::client::legacy::Client<
         hyper_rustls::HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>,
@@ -60,6 +39,8 @@ pub struct State {
     pub opencode_models: RwLock<Arc<Vec<String>>>,
     pub kilo_models: RwLock<Arc<Vec<String>>>,
     pub notify: tokio::sync::Notify,
+    pub opencode_base: String,
+    pub kilo_base: String,
     pub kilo_token: String,
     pub kilo_enabled: bool,
     pub rotator: Option<Arc<crate::rotator::ProxyRotator>>,
@@ -107,21 +88,21 @@ pub fn anthropic_error(status: StatusCode, err_type: &str, message: impl Into<St
 
 pub enum BodyRead {
     Data(Bytes),
-    Respond(BoxRes),
+    Fail(StatusCode, String),
 }
 
 pub async fn read_body(req: Request<Incoming>) -> BodyRead {
     let limited = Limited::new(req.into_body(), MAX_BODY_SIZE);
     match tokio::time::timeout(Duration::from_secs(60), limited.collect()).await {
         Ok(Ok(b)) => BodyRead::Data(b.to_bytes()),
-        Ok(Err(_)) => BodyRead::Respond(error_res(
+        Ok(Err(_)) => BodyRead::Fail(
             StatusCode::PAYLOAD_TOO_LARGE,
-            "Payload too large",
-        )),
-        Err(_) => BodyRead::Respond(error_res(
+            "Payload too large".to_string(),
+        ),
+        Err(_) => BodyRead::Fail(
             StatusCode::REQUEST_TIMEOUT,
-            "Timed out reading request body",
-        )),
+            "Timed out reading request body".to_string(),
+        ),
     }
 }
 
@@ -133,7 +114,13 @@ pub fn auth(state: &State, req: &Request<Incoming>) -> bool {
         .headers()
         .get(AUTHORIZATION)
         .and_then(|h| h.to_str().ok())
-        .map(|s| s.strip_prefix("Bearer ").unwrap_or(s))
+        .map(|s| {
+            if s.len() > 7 && s[..7].eq_ignore_ascii_case("bearer ") {
+                &s[7..]
+            } else {
+                s
+            }
+        })
         .or_else(|| req.headers().get("x-api-key").and_then(|h| h.to_str().ok()));
 
     match tok {
@@ -165,13 +152,13 @@ pub fn get_session(state: &State, user: &str) -> String {
     {
         let lock = state.sessions.read();
         if let Some((id, ts)) = lock.get(user) {
-            if now - ts < SESSION_TTL {
+            if now.saturating_sub(*ts) < SESSION_TTL {
                 return id.clone();
             }
         }
     }
     let mut lock = state.sessions.write();
-    lock.retain(|_, (_, ts)| now - *ts < SESSION_TTL);
+    lock.retain(|_, (_, ts)| now.saturating_sub(*ts) < SESSION_TTL);
     let new_id = oc_id("ses");
     lock.insert(user.to_string(), (new_id.clone(), now));
     new_id
@@ -241,7 +228,31 @@ pub struct SseDeltaBody {
     #[serde(default)]
     pub reasoning: Option<String>,
     #[serde(default)]
+    pub reasoning_content: Option<String>,
+    #[serde(default)]
     pub tool_calls: Option<Vec<SseToolCall>>,
+}
+
+pub fn delta_text(d: &SseDeltaBody) -> Option<String> {
+    d.content
+        .as_deref()
+        .or(d.reasoning.as_deref())
+        .or(d.reasoning_content.as_deref())
+        .map(str::to_string)
+}
+
+pub fn strip_body(res: BoxRes) -> BoxRes {
+    let (parts, _) = res.into_parts();
+    Response::from_parts(parts, full_body(Bytes::new()))
+}
+
+pub fn message_text(msg: &serde_json::Value) -> String {
+    msg["content"]
+        .as_str()
+        .or_else(|| msg["reasoning"].as_str())
+        .or_else(|| msg["reasoning_content"].as_str())
+        .unwrap_or("")
+        .to_string()
 }
 
 #[derive(serde::Deserialize)]
@@ -275,19 +286,109 @@ pub fn upstream_builder(method: Method, uri: String, session: &str) -> hyper::ht
         .header("x-opencode-session", session)
 }
 
-pub fn kilo_builder(method: Method, uri: String, token: &str) -> hyper::http::request::Builder {
-    let auth = if token.is_empty() {
+pub fn kilo_auth_header(token: &str) -> HeaderValue {
+    if token.is_empty() || token == "anonymous" {
         HeaderValue::from_static("Bearer anonymous")
     } else if token.starts_with("Bearer ") {
         HeaderValue::from_str(token).unwrap_or_else(|_| HeaderValue::from_static("Bearer anonymous"))
     } else {
         HeaderValue::from_str(&format!("Bearer {token}")).unwrap_or_else(|_| HeaderValue::from_static("Bearer anonymous"))
-    };
+    }
+}
+
+pub fn kilo_builder(method: Method, uri: String, token: &str) -> hyper::http::request::Builder {
     Request::builder()
         .method(method)
         .uri(uri)
         .header(CONTENT_TYPE, JSON_HEADER.clone())
-        .header(AUTHORIZATION, auth)
+        .header(AUTHORIZATION, kilo_auth_header(token))
+}
+
+pub fn build_https_connector(
+) -> hyper_rustls::HttpsConnector<hyper_util::client::legacy::connect::HttpConnector> {
+    let mut http = hyper_util::client::legacy::connect::HttpConnector::new();
+    http.set_connect_timeout(Some(Duration::from_secs(10)));
+    http.set_nodelay(true);
+    http.set_keepalive(Some(Duration::from_secs(75)));
+    http.enforce_http(false);
+    hyper_rustls::HttpsConnectorBuilder::new()
+        .with_webpki_roots()
+        .https_or_http()
+        .enable_http1()
+        .enable_http2()
+        .wrap_connector(http)
+}
+
+pub fn chat_request(
+    provider: Provider,
+    state: &State,
+    session: &str,
+    body: Bytes,
+) -> Result<Request<BoxBody<Bytes, Err>>, Err> {
+    match provider {
+        Provider::Opencode => upstream_builder(
+            Method::POST,
+            format!("{}/chat/completions", state.opencode_base),
+            session,
+        )
+        .body(full_body(body))
+        .map_err(|e| Box::new(e) as Err),
+        Provider::Kilo => kilo_builder(
+            Method::POST,
+            format!("{}/chat/completions", state.kilo_base),
+            &state.kilo_token,
+        )
+        .body(full_body(body))
+        .map_err(|e| Box::new(e) as Err),
+    }
+}
+
+pub fn is_retryable(status: StatusCode) -> bool {
+    matches!(
+        status,
+        StatusCode::NOT_FOUND
+            | StatusCode::BAD_REQUEST
+            | StatusCode::TOO_MANY_REQUESTS
+            | StatusCode::INTERNAL_SERVER_ERROR
+            | StatusCode::BAD_GATEWAY
+            | StatusCode::SERVICE_UNAVAILABLE
+            | StatusCode::GATEWAY_TIMEOUT
+    )
+}
+
+pub async fn upstream_err_msg(res: Response<Incoming>) -> (StatusCode, String) {
+    let status = res.status();
+    let bytes = match res.into_body().collect().await {
+        Ok(c) => c.to_bytes(),
+        Err(_) => Bytes::new(),
+    };
+    let err: Value = serde_json::from_slice(&bytes).unwrap_or_else(|_| json!({}));
+    let msg = err["error"]["message"]
+        .as_str()
+        .or_else(|| err["message"].as_str())
+        .unwrap_or("Upstream error")
+        .to_string();
+    (status, msg)
+}
+
+pub async fn try_proxied_fallback(
+    state: &State,
+    providers: &[Provider],
+    session: &str,
+    body: &Bytes,
+) -> Option<Response<Incoming>> {
+    for p in providers {
+        let req = match chat_request(*p, state, session, body.clone()) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        match do_proxied_upstream_request(state, req).await {
+            Ok(r) if r.status().is_success() => return Some(r),
+            Ok(r) => eprintln!("proxy via {} failed with {}", p.as_str(), r.status()),
+            Err(e) => eprintln!("proxy via {} failed: {e}", p.as_str()),
+        }
+    }
+    None
 }
 
 pub async fn do_upstream_request(
@@ -306,7 +407,7 @@ pub async fn do_proxied_upstream_request(
             if proxy_url.starts_with("http://") || proxy_url.starts_with("https://") {
                 return build_proxy_request(&proxy_url, req).await;
             } else if proxy_url.starts_with("socks") {
-                eprintln!("socks proxy {proxy_url} not yet supported, using direct");
+                eprintln!("socks proxy {proxy_url} not yet supported, skipping");
             }
         }
     }
@@ -318,7 +419,6 @@ async fn build_proxy_request(
     req: Request<BoxBody<Bytes, Err>>,
 ) -> Result<Response<Incoming>, Err> {
     use hyper_proxy2::{Intercept, Proxy, ProxyConnector};
-    use hyper_util::client::legacy::connect::HttpConnector;
     use hyper_util::rt::TokioExecutor;
     let proxy_uri: hyper::Uri = proxy_url.parse().map_err(|e| format!("invalid proxy uri: {e}"))?;
     let mut proxy = Proxy::new(Intercept::All, proxy_uri);
@@ -333,17 +433,7 @@ async fn build_proxy_request(
             }
         }
     }
-    let mut http = HttpConnector::new();
-    http.set_connect_timeout(Some(Duration::from_secs(10)));
-    http.set_nodelay(true);
-    http.set_keepalive(Some(Duration::from_secs(75)));
-    http.enforce_http(false);
-    let https = hyper_rustls::HttpsConnectorBuilder::new()
-        .with_webpki_roots()
-        .https_or_http()
-        .enable_http1()
-        .enable_http2()
-        .wrap_connector(http);
+    let https = build_https_connector();
     let proxy_connector = ProxyConnector::from_proxy(https, proxy).map_err(|e| format!("proxy connector: {e}"))?;
     let client = hyper_util::client::legacy::Client::builder(TokioExecutor::new())
         .pool_idle_timeout(Duration::from_secs(60))
@@ -367,31 +457,99 @@ impl Provider {
     }
 }
 
-pub fn provider_for_model(state: &State, model: &str) -> Provider {
-    if state.kilo_models.read().iter().any(|m| m == model) {
-        return Provider::Kilo;
-    }
-    if state.opencode_models.read().iter().any(|m| m == model) {
-        return Provider::Opencode;
-    }
-    if model.contains(":free") || model.contains('/') {
-        if model.contains(":free") || model.starts_with("openrouter/") || model.starts_with("kilo-auto") {
-            return Provider::Kilo;
-        }
-        if model.contains('/') {
-            return Provider::Kilo;
+pub fn route_model(state: &State, model: &str) -> (Vec<Provider>, Option<Provider>) {
+    let mut in_kilo = false;
+    let mut in_opencode = false;
+    for m in state.kilo_models.read().iter() {
+        if m == model {
+            in_kilo = true;
+            break;
         }
     }
-    Provider::Opencode
-}
-
-pub fn ordered_providers(state: &State, model: &str) -> Vec<Provider> {
+    for m in state.opencode_models.read().iter() {
+        if m == model {
+            in_opencode = true;
+            break;
+        }
+    }
+    let owner = match (in_kilo, in_opencode) {
+        (true, false) => Some(Provider::Kilo),
+        (false, true) => Some(Provider::Opencode),
+        _ => None,
+    };
     if !state.kilo_enabled {
-        return vec![Provider::Opencode];
+        return (vec![Provider::Opencode], owner);
     }
-    let primary = provider_for_model(state, model);
-    match primary {
+    let primary = if in_kilo {
+        Provider::Kilo
+    } else if in_opencode {
+        Provider::Opencode
+    } else if model.contains(":free") || model.contains('/') {
+        Provider::Kilo
+    } else {
+        Provider::Opencode
+    };
+    let providers = match primary {
         Provider::Kilo => vec![Provider::Kilo, Provider::Opencode],
         Provider::Opencode => vec![Provider::Opencode, Provider::Kilo],
+    };
+    (providers, owner)
+}
+
+pub async fn fetch_raw_with_fallback(
+    state: &State,
+    model: &str,
+    session: &str,
+    body: &Bytes,
+) -> Result<Response<Incoming>, Err> {
+    let (providers, owner) = route_model(state, model);
+    let mut last_res: Option<Response<Incoming>> = None;
+    let mut last_err: Option<Err> = None;
+    let mut seen_429 = false;
+
+    for (idx, provider) in providers.iter().enumerate() {
+        let req = chat_request(*provider, state, session, body.clone())?;
+        match do_upstream_request(state, req).await {
+            Ok(res) => {
+                let status = res.status();
+                if status.is_success() {
+                    return Ok(res);
+                }
+                if status == StatusCode::TOO_MANY_REQUESTS {
+                    seen_429 = true;
+                }
+                if idx + 1 < providers.len()
+                    && owner != Some(*provider)
+                    && is_retryable(status)
+                {
+                    eprintln!("{} provider failed for model {} with {}, trying fallback", provider.as_str(), model, status);
+                    last_res = Some(res);
+                    continue;
+                }
+                last_res = Some(res);
+                break;
+            }
+            Err(e) => {
+                if idx + 1 < providers.len() && owner != Some(*provider) {
+                    eprintln!("{} request failed: {e}, trying fallback", provider.as_str());
+                    continue;
+                }
+                last_err = Some(e);
+                break;
+            }
+        }
+    }
+
+    if state.rotator.is_some() && (seen_429 || (last_res.is_none() && last_err.is_some())) {
+        eprintln!("rate-limited or unreachable for {model}, trying via proxy");
+        if let Some(r) = try_proxied_fallback(state, &providers, session, body).await {
+            return Ok(r);
+        }
+    }
+
+    match (last_res, last_err) {
+        (Some(r), _) => Ok(r),
+        (None, Some(e)) => Err(e),
+        (None, None) => Err("All providers failed".into()),
     }
 }

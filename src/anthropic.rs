@@ -1,11 +1,11 @@
 use crate::common::{
-    anthropic_error, auth, full_body, get_session, json_res, kilo_base, oc_id, read_body, sse_frame,
-    sse_response, upstream_base, BoxRes, Err, State, SseDelta,
+    anthropic_error, auth, get_session, json_res, oc_id, read_body, sse_frame,
+    sse_response, BoxRes, Err, State, SseDelta,
 };
 use bytes::{Bytes, BytesMut};
 use http_body_util::{combinators::BoxBody, BodyExt, StreamBody};
 use hyper::body::Frame;
-use hyper::{Method, Request, Response, StatusCode};
+use hyper::{Request, Response, StatusCode};
 use serde_json::{json, Value};
 use std::{collections::HashMap, sync::Arc};
 use tokio_stream::{wrappers::ReceiverStream, StreamExt};
@@ -17,7 +17,9 @@ pub async fn handle_messages(req: Request<hyper::body::Incoming>, state: Arc<Sta
 
     let body_bytes = match read_body(req).await {
         crate::common::BodyRead::Data(b) => b,
-        crate::common::BodyRead::Respond(r) => return Ok(r),
+        crate::common::BodyRead::Fail(status, msg) => {
+            return Ok(anthropic_error(status, "invalid_request_error", msg))
+        }
     };
     let ant_body: Value = match serde_json::from_slice(&body_bytes) {
         Ok(v) => v,
@@ -45,10 +47,16 @@ pub async fn handle_messages(req: Request<hyper::body::Incoming>, state: Arc<Sta
                 for b in arr {
                     match b["type"].as_str().unwrap_or("") {
                         "text" => text.push_str(b["text"].as_str().unwrap_or("")),
-                        "tool_use" => tool_calls.push(json!({
-                            "id": b["id"], "type": "function",
-                            "function": {"name": b["name"], "arguments": b["input"].to_string()}
-                        })),
+                        "tool_use" => {
+                            let args = match b.get("input") {
+                                Some(v) if !v.is_null() => v.to_string(),
+                                _ => "{}".to_string(),
+                            };
+                            tool_calls.push(json!({
+                                "id": b["id"], "type": "function",
+                                "function": {"name": b["name"], "arguments": args}
+                            }));
+                        }
                         "tool_result" => {
                             oai_msgs.push(json!({
                                 "role": "tool",
@@ -109,107 +117,13 @@ pub async fn handle_messages(req: Request<hyper::body::Incoming>, state: Arc<Sta
     }
 
     let payload_bytes = serde_json::to_vec(&req_payload)?;
-    let providers = crate::common::ordered_providers(&state, model);
-
-    let mut upstream_res: Option<Response<hyper::body::Incoming>> = None;
-    for (idx, provider) in providers.iter().enumerate() {
-        let req = match provider {
-            crate::common::Provider::Opencode => crate::common::upstream_builder(
-                Method::POST,
-                format!("{}/chat/completions", upstream_base()),
-                &session,
-            )
-            .body(full_body(Bytes::from(payload_bytes.clone())))?,
-            crate::common::Provider::Kilo => crate::common::kilo_builder(
-                Method::POST,
-                format!("{}/chat/completions", kilo_base()),
-                &state.kilo_token,
-            )
-            .body(full_body(Bytes::from(payload_bytes.clone())))?,
-        };
-
-        match crate::common::do_upstream_request(&state, req).await {
-            Ok(res) => {
-                if res.status().is_success() {
-                    upstream_res = Some(res);
-                    break;
-                }
-                let status = res.status();
-                let is_last = idx == providers.len() - 1;
-                let err_bytes = match res.into_body().collect().await {
-                    Ok(c) => c.to_bytes(),
-                    Err(_) => {
-                        if !is_last {
-                            eprintln!("{} provider failed for model {} with {}, trying fallback", provider.as_str(), model, status);
-                            continue;
-                        } else {
-                            return Ok(anthropic_error(status, "upstream_error", "Upstream error"));
-                        }
-                    }
-                };
-                let err_json: Value = serde_json::from_slice(&err_bytes).unwrap_or_else(|_| json!({}));
-                let msg = err_json["error"]["message"].as_str().unwrap_or("Upstream error").to_string();
-                if !is_last
-                    && (status == StatusCode::NOT_FOUND
-                        || status == StatusCode::BAD_REQUEST
-                        || status == StatusCode::TOO_MANY_REQUESTS)
-                {
-                    eprintln!("{} provider failed for model {} with {}: {}, trying fallback", provider.as_str(), model, status, msg);
-                    continue;
-                } else {
-                    if status == StatusCode::TOO_MANY_REQUESTS && state.rotator.is_some() {
-                        eprintln!("rate-limited on {model}, trying via proxy");
-                        for p in &providers {
-                            let proxy_req = match p {
-                                crate::common::Provider::Opencode => crate::common::upstream_builder(
-                                    Method::POST,
-                                    format!("{}/chat/completions", upstream_base()),
-                                    &session,
-                                )
-                                .body(full_body(Bytes::from(payload_bytes.clone())))?,
-                                crate::common::Provider::Kilo => crate::common::kilo_builder(
-                                    Method::POST,
-                                    format!("{}/chat/completions", kilo_base()),
-                                    &state.kilo_token,
-                                )
-                                .body(full_body(Bytes::from(payload_bytes.clone())))?,
-                            };
-                            match crate::common::do_proxied_upstream_request(&state, proxy_req).await {
-                                Ok(r) if r.status().is_success() => {
-                                    upstream_res = Some(r);
-                                    break;
-                                }
-                                Ok(r) => eprintln!("proxy via {} failed with {}", p.as_str(), r.status()),
-                                Err(e) => eprintln!("proxy via {} failed: {e}", p.as_str()),
-                            }
-                        }
-                        if upstream_res.is_some() {
-                            break;
-                        }
-                    }
-                    return Ok(anthropic_error(status, "upstream_error", msg));
-                }
-            }
-            Err(e) => {
-                if idx == providers.len() - 1 {
-                    return Err(e);
-                }
-                eprintln!("{} request failed: {e}, trying fallback", provider.as_str());
-                continue;
-            }
-        }
-    }
-
-    let upstream_res = upstream_res.ok_or_else(|| -> Err { "all providers failed".into() })?;
+    let proxy_body = Bytes::from(payload_bytes);
+    let upstream_res =
+        crate::common::fetch_raw_with_fallback(&state, model, &session, &proxy_body).await?;
     let status = upstream_res.status();
     if !status.is_success() {
-        let err_bytes = upstream_res.into_body().collect().await?.to_bytes();
-        let err_json: Value = serde_json::from_slice(&err_bytes).unwrap_or_else(|_| json!({}));
-        return Ok(anthropic_error(
-            status,
-            "upstream_error",
-            err_json["error"]["message"].as_str().unwrap_or("Upstream error"),
-        ));
+        let (status, msg) = crate::common::upstream_err_msg(upstream_res).await;
+        return Ok(anthropic_error(status, "upstream_error", msg));
     }
 
     if !stream {
@@ -234,10 +148,8 @@ fn anthropic_from_oai(model: &str, oai_res: &Value) -> Value {
     let choice = &oai_res["choices"][0];
     let mut content = Vec::new();
 
-    let txt = choice["message"]["content"]
-        .as_str()
-        .or_else(|| choice["message"]["reasoning"].as_str())
-        .unwrap_or("");
+    let txt = crate::common::message_text(&choice["message"]);
+    let txt = txt.as_str();
     if !txt.is_empty() {
         content.push(json!({"type": "text", "text": txt}));
     }
@@ -335,7 +247,7 @@ fn spawn_anthropic_stream(
                             ));
                         }
 
-                        let txt_opt = choice.delta.content.clone().or_else(|| choice.delta.reasoning.clone());
+                        let txt_opt = crate::common::delta_text(&choice.delta);
                         if let Some(txt) = txt_opt {
                             let idx = match text_block_idx {
                                 Some(i) => i,
@@ -366,7 +278,7 @@ fn spawn_anthropic_stream(
                                         next_block_idx += 1;
                                         tool_block_indices.insert(tc_idx, i);
                                         let name = tc.function.as_ref().and_then(|f| f.name.clone()).unwrap_or_default();
-                                        let tc_id = tc.id.clone().unwrap_or_else(|| msg_id.clone());
+                                        let tc_id = tc.id.clone().unwrap_or_else(|| oc_id("toolu"));
                                         send!(sse_frame(
                                             "content_block_start",
                                             &json!({"type": "content_block_start", "index": i, "content_block": {"type": "tool_use", "id": tc_id, "name": name, "input": {}}})
@@ -385,7 +297,11 @@ fn spawn_anthropic_stream(
                         }
 
                         if let Some(fr) = choice.finish_reason.clone() {
-                            stop_reason = if fr == "tool_calls" { "tool_use" } else { "end_turn" };
+                            stop_reason = match fr.as_str() {
+                                "tool_calls" => "tool_use",
+                                "length" => "max_tokens",
+                                _ => "end_turn",
+                            };
                         }
                     }
                 }

@@ -38,6 +38,16 @@ $Tmp = Join-Path ([IO.Path]::GetTempPath()) ("ocproxy-" + [guid]::NewGuid().ToSt
 New-Item -ItemType Directory -Path $Tmp | Out-Null
 try {
     Invoke-WebRequest -Uri $Url -OutFile (Join-Path $Tmp $Asset) -UseBasicParsing
+    try {
+        Invoke-WebRequest -Uri "$Url.sha256" -OutFile (Join-Path $Tmp "checksum") -UseBasicParsing
+        $Want = (((Get-Content (Join-Path $Tmp "checksum") -TotalCount 1) -split '\s+')[0]).ToLower()
+        $Got = ((Get-FileHash -Algorithm SHA256 -Path (Join-Path $Tmp $Asset)).Hash).ToLower()
+        if ($Got -ne $Want) { throw "checksum mismatch for $Asset" }
+        Info "checksum verified"
+    } catch {
+        if ($_.Exception.Message -match "checksum mismatch") { throw }
+        Info "checksum unavailable, skipping verification"
+    }
     Expand-Archive -Path (Join-Path $Tmp $Asset) -DestinationPath $Tmp -Force
 
     $Src = Get-ChildItem -Path $Tmp -Filter $Bin -Recurse | Select-Object -First 1

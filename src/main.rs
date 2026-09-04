@@ -5,7 +5,7 @@ mod models;
 mod openai;
 mod rotator;
 
-use common::{auth, error_res, json_res, BoxRes, Err, State};
+use common::{auth, build_https_connector, error_res, json_res, BoxRes, Err, State};
 use config::Config;
 use hyper::body::Incoming;
 use hyper::{Method, Request, StatusCode};
@@ -22,7 +22,7 @@ async fn router(req: Request<Incoming>, state: Arc<State>, peer: String) -> Resu
             let opencode_cnt = state.opencode_models.read().len();
             let kilo_cnt = state.kilo_models.read().len();
             let rotator_status = state.rotator.as_ref().map(|r| r.status());
-            Ok(json_res(
+            let res = json_res(
                 StatusCode::OK,
                 json!({
                     "status": "ok",
@@ -36,19 +36,38 @@ async fn router(req: Request<Incoming>, state: Arc<State>, peer: String) -> Resu
                     },
                     "proxy_rotator": rotator_status
                 }),
-            ))
+            );
+            Ok(if req.method() == Method::HEAD {
+                common::strip_body(res)
+            } else {
+                res
+            })
         }
         (&Method::GET, "/v1/models") | (&Method::HEAD, "/v1/models") => {
             if !auth(&state, &req) {
                 return Ok(error_res(StatusCode::UNAUTHORIZED, "Invalid API key"));
             }
+            let head_only = req.method() == Method::HEAD;
             match models::wait_for_models(&state).await {
                 Some(models) => {
+                    let kilo_set = state.kilo_models.read();
+                    let created = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
                     let data: Vec<_> = models
                         .iter()
-                        .map(|id| json!({"id": id, "object": "model", "created": 1779000000, "owned_by": "opencode-free"}))
+                        .map(|id| {
+                            let owned_by = if kilo_set.iter().any(|m| m == id) {
+                                "kilo-free"
+                            } else {
+                                "opencode-free"
+                            };
+                            json!({"id": id, "object": "model", "created": created, "owned_by": owned_by})
+                        })
                         .collect();
-                    Ok(json_res(StatusCode::OK, json!({"object": "list", "data": data})))
+                    let res = json_res(StatusCode::OK, json!({"object": "list", "data": data}));
+                    Ok(if head_only { common::strip_body(res) } else { res })
                 }
                 None => Ok(json_res(
                     StatusCode::SERVICE_UNAVAILABLE,
@@ -77,7 +96,11 @@ fn print_banner(addr: &str, cfg: &Config, config_line: Option<&str>, rotator: &O
         println!("  Auth   none required");
     }
     if cfg.kilo_enabled {
-        let token_display = if cfg.kilo_token == "anonymous" { "anonymous".to_string() } else { format!("{}...", &cfg.kilo_token[..8.min(cfg.kilo_token.len())]) };
+        let token_display = if cfg.kilo_token == "anonymous" {
+            "anonymous".to_string()
+        } else {
+            format!("{}...", cfg.kilo_token.chars().take(8).collect::<String>())
+        };
         println!("  Kilo   enabled (token: {token_display})");
     } else {
         println!("  Kilo   disabled");
@@ -156,18 +179,31 @@ async fn main() -> Result<(), Err> {
 
     let addr = format!("{host}:{port}");
 
-    let mut http = hyper_util::client::legacy::connect::HttpConnector::new();
-    http.set_connect_timeout(Some(Duration::from_secs(10)));
-    http.set_nodelay(true);
-    http.set_keepalive(Some(Duration::from_secs(75)));
-    http.enforce_http(false);
+    let trim_base = |b: String| {
+        let t = b.trim_end_matches('/').to_string();
+        if t.is_empty() { b } else { t }
+    };
+    let opencode_base = trim_base(
+        env::var("OPENCODE_UPSTREAM").unwrap_or_else(|_| common::UPSTREAM_BASE_DEFAULT.to_string()),
+    );
+    let kilo_base = trim_base(
+        cli.kilo_upstream
+            .clone()
+            .or_else(|| {
+                env::var("KILO_UPSTREAM")
+                    .or_else(|_| env::var("KILO_BASE"))
+                    .ok()
+            })
+            .unwrap_or_else(|| common::KILO_BASE_DEFAULT.to_string()),
+    );
+    for (name, base) in [("OPENCODE_UPSTREAM", &opencode_base), ("KILO_UPSTREAM", &kilo_base)] {
+        if base.parse::<hyper::Uri>().is_err() {
+            eprintln!("error: invalid {name} url: {base}");
+            std::process::exit(2);
+        }
+    }
 
-    let https = hyper_rustls::HttpsConnectorBuilder::new()
-        .with_webpki_roots()
-        .https_or_http()
-        .enable_http1()
-        .enable_http2()
-        .wrap_connector(http);
+    let https = build_https_connector();
 
     let client = hyper_util::client::legacy::Client::builder(TokioExecutor::new())
         .pool_idle_timeout(Duration::from_secs(120))
@@ -183,6 +219,8 @@ async fn main() -> Result<(), Err> {
         opencode_models: RwLock::new(Arc::new(Vec::new())),
         kilo_models: RwLock::new(Arc::new(Vec::new())),
         notify: Notify::new(),
+        opencode_base,
+        kilo_base,
         kilo_token: cfg.kilo_token.clone(),
         kilo_enabled: cfg.kilo_enabled,
         rotator: rotator.clone(),
@@ -195,6 +233,7 @@ async fn main() -> Result<(), Err> {
 
     let auto_server = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new());
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::mpsc::channel::<()>(1);
+    let mut conns = tokio::task::JoinSet::new();
 
     #[cfg(unix)]
     tokio::spawn(async move {
@@ -223,7 +262,7 @@ async fn main() -> Result<(), Err> {
                     let auto_server = auto_server.clone();
                     let peer_ip = peer.ip().to_string();
 
-                    tokio::spawn(async move {
+                    conns.spawn(async move {
                         let service = hyper::service::service_fn(move |req| router(req, Arc::clone(&state), peer_ip.clone()));
                         let _ = auto_server.serve_connection(io, service).await;
                     });
@@ -234,6 +273,11 @@ async fn main() -> Result<(), Err> {
             }
         }
     }
+
+    let _ = tokio::time::timeout(Duration::from_secs(5), async {
+        while conns.join_next().await.is_some() {}
+    })
+    .await;
 
     Ok(())
 }

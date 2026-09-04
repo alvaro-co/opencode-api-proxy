@@ -4,7 +4,7 @@ Ultra-fast, lightweight proxy written in Rust (`hyper` + `tokio`). It provides a
 
 Designed to seamlessly integrate coding assistants like Cursor, Roo Code, Cline, Aider, OpenCode, and any OpenAI/Anthropic API-compatible client with free LLMs without configuration friction or managing custom headers.
 
-The static binary is ~1.6MB, consumes ~2-3MB of RAM with virtually zero CPU overhead. It uses `webpki-roots` (no OpenSSL runtime dependency) and features zero-copy streaming pass-through for OpenAI requests and real-time line-by-line event translation for Anthropic/Responses SSE clients.
+The static binary is ~3MB, consumes ~2-3MB of RAM with virtually zero CPU overhead. It uses `webpki-roots` (no OpenSSL runtime dependency) and features zero-copy streaming pass-through for OpenAI requests and real-time line-by-line event translation for Anthropic/Responses SSE clients.
 
 ---
 
@@ -26,7 +26,7 @@ iwr https://raw.githubusercontent.com/alvaro-co/opencode-api-proxy/main/install.
 
 ### Keep it always running + auto-updated
 
-`keeper.sh` / `keeper.ps1` supervise the binary: they install it if missing, check GitHub for new releases every hour (configurable) and hot-restart on update, and restart the process automatically if it ever crashes — with exponential backoff.
+`keeper.sh` / `keeper.ps1` supervise the binary: they install it if missing, check GitHub for new releases every hour (configurable) and hot-restart on update, and restart the process automatically if it ever crashes — with exponential backoff. Downloaded updates are sha256-verified when the release publishes checksums.
 
 ```bash
 # Linux / macOS
@@ -96,7 +96,7 @@ opencode-api-proxy [OPTIONS]
 | `-h`, `--help` | Show help | |
 | `-V`, `--version` | Show version | |
 
-Environment variables (lower precedence than flags): `PORT` (or `PROXY_PORT`), `ENABLE_AUTH`, `API_KEY`, `CONFIG_FILE`, `OPENCODE_UPSTREAM`, `KILO_TOKEN`, `KILO_UPSTREAM`, `KILO_ENABLED`.
+Environment variables (lower precedence than flags): `PORT` (or `PROXY_PORT`), `ENABLE_AUTH`, `API_KEY`, `CONFIG_FILE`, `OPENCODE_UPSTREAM`, `KILO_TOKEN` (or `KILO_AUTH_TOKEN`), `KILO_UPSTREAM` (or `KILO_BASE`), `KILO_ENABLED`.
 
 ### Auth resolution order (highest first)
 
@@ -113,7 +113,7 @@ Environment variables (lower precedence than flags): `PORT` (or `PROXY_PORT`), `
 Every start prints a short status block:
 
 ```
-opencode-api-proxy v1.2.0
+opencode-api-proxy v1.2.1
   URL    http://0.0.0.0:6446
   Auth   none required
   Kilo   enabled (token: anonymous)
@@ -155,9 +155,9 @@ journalctl -u opencode-api-proxy -f
 The proxy merges free models from both upstreams and routes requests intelligently:
 
 - **OpenCode** (`https://opencode.ai/zen/v1`) — 8 free models like `big-pickle`, `deepseek-v4-flash-free`, `mimo-v2.5-free` (IDs ending in `-free`, no slash). Auth: `Bearer public`.
-- **Kilo** (`https://api.kilo.ai/api/openrouter`) — 24 free models like `stepfun/step-3.7-flash:free`, `kilo-auto/free`, `openrouter/free` (IDs with `:free`, `/`, or `isFree=true`). Auth: `Bearer anonymous` by default, or your own via `--kilo-token` / `KILO_TOKEN`.
+- **Kilo** (`https://api.kilo.ai/api/openrouter`) — 24 free models like `stepfun/step-3.7-flash:free`, `kilo-auto/free`, `openrouter/free` (IDs containing `:free`, `isFree=true`, or `(free)` in the name). Auth: `Bearer anonymous` by default, or your own via `--kilo-token` / `KILO_TOKEN`.
 
-**Routing:** The proxy picks the provider that actually owns the requested model ID (exact match). For unknown IDs it uses a heuristic (`:` / `/` → Kilo, else Opencode). **Fallback:** If the primary provider returns 429 (rate limit) or 400/404, it automatically retries the other provider. If both are rate-limited and proxies are configured, it retries via the next proxy. This makes the two free tiers act as backups for each other — no manual switching needed.
+**Routing:** The proxy picks the provider that actually owns the requested model ID (exact match). For unknown IDs it uses a heuristic (`:` / `/` → Kilo, else Opencode). **Fallback:** If the primary provider fails with a retryable error (429/400/404/5xx) *and the other provider could plausibly serve the model*, it retries there. If a model is known to live on only one provider, that provider's result is returned as-is (nowhere else to get it from). If rate-limited everywhere and proxies are configured, it retries via the next proxy. This makes the two free tiers act as backups for each other — no manual switching needed.
 
 Override Kilo upstream/token if you self-host or have a custom gateway:
 

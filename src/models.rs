@@ -1,9 +1,9 @@
-use crate::common::{full_body, kilo_base, upstream_base, update_merged_models, Err, State, AUTH_HEADER, UA_HEADER};
+use crate::common::{full_body, kilo_auth_header, update_merged_models, Err, State, AUTH_HEADER, UA_HEADER};
 use hyper::header::AUTHORIZATION;
 use http_body_util::BodyExt;
 use hyper::{Method, Request};
 use serde_json::Value;
-use std::{sync::Arc, time::{Duration, Instant}};
+use std::{sync::{atomic::{AtomicBool, Ordering}, Arc}, time::{Duration, Instant}};
 
 const REFRESH_INTERVAL: Duration = Duration::from_secs(3600);
 const RETRY_INTERVAL: Duration = Duration::from_secs(15);
@@ -13,20 +13,16 @@ fn is_kilo_free(item: &Value) -> bool {
     if item.get("isFree").and_then(|v| v.as_bool()) == Some(true) {
         return true;
     }
-    if let Some(id) = item.get("id").and_then(|v| v.as_str()) {
-        if id.contains(":free") {
+    if item
+        .get("id")
+        .and_then(|v| v.as_str())
+        .is_some_and(|id| id.contains(":free"))
+    {
+        return true;
+    }
+    if let Some(name) = item.get("name").and_then(|v| v.as_str()) {
+        if name.to_lowercase().contains("(free)") {
             return true;
-        }
-        if id.starts_with("openrouter/") {
-            return true;
-        }
-        if !id.contains('/') {
-            return true;
-        }
-        if let Some(name) = item.get("name").and_then(|v| v.as_str()) {
-            if name.to_lowercase().contains("(free)") {
-                return true;
-            }
         }
     }
     false
@@ -35,7 +31,7 @@ fn is_kilo_free(item: &Value) -> bool {
 pub async fn fetch_opencode_models(state: &Arc<State>) -> Result<Vec<String>, Err> {
     let req = Request::builder()
         .method(Method::GET)
-        .uri(format!("{}/models", upstream_base()))
+        .uri(format!("{}/models", state.opencode_base))
         .header(AUTHORIZATION, AUTH_HEADER.clone())
         .header("User-Agent", UA_HEADER.clone())
         .body(full_body(bytes::Bytes::new()))?;
@@ -67,18 +63,11 @@ pub async fn fetch_kilo_models(state: &Arc<State>) -> Result<Vec<String>, Err> {
     if !state.kilo_enabled {
         return Err("kilo disabled".into());
     }
-    let token = state.kilo_token.clone();
-    let auth = if token.is_empty() || token == "anonymous" {
-        hyper::header::HeaderValue::from_static("Bearer anonymous")
-    } else if token.starts_with("Bearer ") {
-        hyper::header::HeaderValue::from_str(&token).unwrap_or_else(|_| hyper::header::HeaderValue::from_static("Bearer anonymous"))
-    } else {
-        hyper::header::HeaderValue::from_str(&format!("Bearer {token}")).unwrap_or_else(|_| hyper::header::HeaderValue::from_static("Bearer anonymous"))
-    };
+    let auth = kilo_auth_header(&state.kilo_token);
 
     let req = Request::builder()
         .method(Method::GET)
-        .uri(format!("{}/models", kilo_base()))
+        .uri(format!("{}/models", state.kilo_base))
         .header(AUTHORIZATION, auth)
         .body(full_body(bytes::Bytes::new()))?;
 
@@ -119,8 +108,19 @@ pub async fn wait_for_models(state: &Arc<State>) -> Option<Arc<Vec<String>>> {
     }
 }
 
+fn announce_merged_once(state: &Arc<State>, flag: &Arc<AtomicBool>) {
+    if !flag.swap(true, Ordering::SeqCst) {
+        let merged = state.models.read().len();
+        if merged > 0 {
+            println!("  Models {merged} available (merged, auto-refresh hourly)");
+        }
+    }
+}
+
 pub fn spawn_refresher(state: Arc<State>) {
+    let merged_announced = Arc::new(AtomicBool::new(false));
     let s1 = Arc::clone(&state);
+    let f1 = Arc::clone(&merged_announced);
     tokio::spawn(async move {
         let mut announced = false;
         let mut fails = 0u32;
@@ -132,6 +132,7 @@ pub fn spawn_refresher(state: Arc<State>) {
                         announced = true;
                         println!("  Opencode: {} free models (auto-refresh hourly)", list.len());
                     }
+                    announce_merged_once(&s1, &f1);
                     tokio::time::sleep(REFRESH_INTERVAL).await;
                 }
                 Err(e) => {
@@ -145,40 +146,33 @@ pub fn spawn_refresher(state: Arc<State>) {
         }
     });
 
-    if state.kilo_enabled {
-        let s2 = Arc::clone(&state);
-        tokio::spawn(async move {
-            let mut announced = false;
-            let mut fails = 0u32;
-            loop {
-                match fetch_kilo_models(&s2).await {
-                    Ok(list) => {
-                        fails = 0;
-                        if !announced {
-                            announced = true;
-                            println!("  Kilo: {} free models (auto-refresh hourly)", list.len());
-                            let merged = s2.models.read().len();
-                            println!("  Models {} available (merged, auto-refresh hourly)", merged);
-                        }
-                        tokio::time::sleep(REFRESH_INTERVAL).await;
+    if !state.kilo_enabled {
+        return;
+    }
+    let s2 = Arc::clone(&state);
+    let f2 = Arc::clone(&merged_announced);
+    tokio::spawn(async move {
+        let mut announced = false;
+        let mut fails = 0u32;
+        loop {
+            match fetch_kilo_models(&s2).await {
+                Ok(list) => {
+                    fails = 0;
+                    if !announced {
+                        announced = true;
+                        println!("  Kilo: {} free models (auto-refresh hourly)", list.len());
                     }
-                    Err(e) => {
-                        fails += 1;
-                        if fails == 1 || fails.is_multiple_of(20) {
-                            eprintln!("kilo model refresh failed (attempt {fails}): {e}; retrying");
-                        }
-                        tokio::time::sleep(RETRY_INTERVAL).await;
+                    announce_merged_once(&s2, &f2);
+                    tokio::time::sleep(REFRESH_INTERVAL).await;
+                }
+                Err(e) => {
+                    fails += 1;
+                    if fails == 1 || fails.is_multiple_of(20) {
+                        eprintln!("kilo model refresh failed (attempt {fails}): {e}; retrying");
                     }
+                    tokio::time::sleep(RETRY_INTERVAL).await;
                 }
             }
-        });
-    } else {
-        tokio::spawn(async move {
-            let _ = fetch_opencode_models(&state).await;
-            let merged = state.models.read().len();
-            if merged > 0 {
-                println!("  Models {} available (auto-refresh hourly)", merged);
-            }
-        });
-    }
+        }
+    });
 }

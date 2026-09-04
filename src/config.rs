@@ -2,13 +2,25 @@ use crate::common::gen_api_key;
 use serde_json::{json, Value};
 use std::{env, fs, path::Path};
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct Config {
     pub enable_auth: bool,
     pub api_key: String,
     pub generated: bool,
     pub kilo_token: String,
     pub kilo_enabled: bool,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Config {
+            enable_auth: false,
+            api_key: String::new(),
+            generated: false,
+            kilo_token: "anonymous".to_string(),
+            kilo_enabled: true,
+        }
+    }
 }
 
 pub fn default_path() -> String {
@@ -108,8 +120,8 @@ Environment variables:
   API_KEY=<key>           Use a fixed API key
   CONFIG_FILE=path        Config file location
   OPENCODE_UPSTREAM=url   Override upstream API base (default: https://opencode.ai/zen/v1)
-  KILO_TOKEN=token        Kilo auth token
-  KILO_UPSTREAM=url       Kilo upstream base
+  KILO_TOKEN=token        Kilo auth token (KILO_AUTH_TOKEN also accepted)
+  KILO_UPSTREAM=url       Kilo upstream base (KILO_BASE also accepted)
   KILO_ENABLED=true|false Enable/disable Kilo (default true)
 
 Endpoints:
@@ -146,16 +158,32 @@ pub fn parse_args() -> Result<Cli, String> {
                 }
             }};
         }
+        macro_rules! no_value {
+            ($name:expr) => {
+                if inline_val.is_some() {
+                    return Err(format!("{} takes no value", $name));
+                }
+            };
+        }
         match flag.as_str() {
             "-p" | "--port" => cli.port = Some(value!("--port")?),
             "-H" | "--host" => cli.host = Some(value!("--host")?),
-            "-a" | "--auth" => cli.auth_flag = true,
+            "-a" | "--auth" => {
+                no_value!("--auth");
+                cli.auth_flag = true;
+            }
             "-k" | "--api-key" => cli.api_key = Some(value!("--api-key")?),
             "-c" | "--config" => cli.config_path = Some(value!("--config")?),
-            "--enforce-config" => cli.enforce_config = true,
+            "--enforce-config" => {
+                no_value!("--enforce-config");
+                cli.enforce_config = true;
+            }
             "--kilo-token" => cli.kilo_token = Some(value!("--kilo-token")?),
             "--kilo-upstream" => cli.kilo_upstream = Some(value!("--kilo-upstream")?),
-            "--no-kilo" => cli.no_kilo = true,
+            "--no-kilo" => {
+                no_value!("--no-kilo");
+                cli.no_kilo = true;
+            }
             "--proxy" => cli.proxies.push(value!("--proxy")?),
             "--proxy-file" => cli.proxy_file = Some(value!("--proxy-file")?),
             "--proxy-url" => cli.proxy_url = Some(value!("--proxy-url")?),
@@ -163,8 +191,14 @@ pub fn parse_args() -> Result<Cli, String> {
                 let v: u64 = value!("--proxy-interval")?.parse().map_err(|_| "invalid --proxy-interval")?;
                 cli.proxy_interval = Some(v);
             }
-            "-h" | "--help" => cli.help = true,
-            "-V" | "--version" => cli.version = true,
+            "-h" | "--help" => {
+                no_value!("--help");
+                cli.help = true;
+            }
+            "-V" | "--version" => {
+                no_value!("--version");
+                cli.version = true;
+            }
             other => return Err(format!("unknown argument: {other} (see --help)")),
         }
     }
@@ -232,14 +266,5 @@ pub fn resolve(cli: &Cli) -> (Config, Option<String>) {
     if cfg.kilo_token.is_empty() {
         cfg.kilo_token = "anonymous".to_string();
     }
-    if cli.kilo_upstream.is_some() {
-        let v = cli.kilo_upstream.clone().unwrap();
-        std::env::set_var("KILO_UPSTREAM", v);
-        std::env::set_var("KILO_BASE", std::env::var("KILO_UPSTREAM").unwrap());
-    } else if let Ok(v) = env::var("KILO_UPSTREAM").or_else(|_| env::var("KILO_BASE")) {
-        std::env::set_var("KILO_UPSTREAM", v.clone());
-        std::env::set_var("KILO_BASE", v);
-    }
-
     (cfg, file_cfg.map(|_| path))
 }

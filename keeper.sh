@@ -78,6 +78,23 @@ install_update() {
     (
         cd "$TMP" || exit 1
         fetch "https://github.com/${REPO}/releases/latest/download/${ASSET}" >"$ASSET" || exit 1
+        if fetch "https://github.com/${REPO}/releases/latest/download/${ASSET}.sha256" >"${ASSET}.sha256" 2>/dev/null; then
+            WANT="$(cut -d' ' -f1 <"${ASSET}.sha256")"
+            if command -v sha256sum >/dev/null 2>&1; then
+                GOT="$(sha256sum "$ASSET" | cut -d' ' -f1)"
+            elif command -v shasum >/dev/null 2>&1; then
+                GOT="$(shasum -a 256 "$ASSET" | cut -d' ' -f1)"
+            else
+                GOT=""
+                log "warn" "no sha256 tool found, skipping checksum verification"
+            fi
+            if [ -n "${GOT:-}" ] && [ "$GOT" != "$WANT" ]; then
+                log "error" "checksum mismatch for $ASSET"
+                exit 1
+            fi
+        else
+            log "warn" "no checksum file published, skipping verification"
+        fi
         tar -xzf "$ASSET" || exit 1
         SRC=""
         [ -f "$BIN" ] && SRC="$BIN"

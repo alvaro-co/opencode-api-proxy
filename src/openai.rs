@@ -1,12 +1,12 @@
 use crate::common::{
-    auth, error_res, full_body, get_session, json_res, rand_hex, read_body, sse_frame,
+    auth, error_res, get_session, json_res, rand_hex, read_body, sse_frame,
     sse_response, BoxRes, Err, State, SseDelta,
 };
 use bytes::{Bytes, BytesMut};
 use http_body_util::{combinators::BoxBody, BodyExt, StreamBody};
 use hyper::body::Frame;
 use hyper::header::{CACHE_CONTROL, CONTENT_TYPE};
-use hyper::{Method, Request, Response, StatusCode};
+use hyper::{Request, Response, StatusCode};
 use serde_json::{json, Value};
 use std::{
     collections::HashMap,
@@ -22,7 +22,7 @@ pub async fn handle_chat_completions(req: Request<hyper::body::Incoming>, state:
 
     let body_bytes = match read_body(req).await {
         crate::common::BodyRead::Data(b) => b,
-        crate::common::BodyRead::Respond(r) => return Ok(r),
+        crate::common::BodyRead::Fail(status, msg) => return Ok(error_res(status, msg)),
     };
     let body_json: Value = match serde_json::from_slice(&body_bytes) {
         Ok(v) => v,
@@ -32,85 +32,9 @@ pub async fn handle_chat_completions(req: Request<hyper::body::Incoming>, state:
     let model = body_json["model"].as_str().unwrap_or("");
     let stream = body_json["stream"].as_bool().unwrap_or(false);
     let session = get_session(&state, &peer);
-    let providers = crate::common::ordered_providers(&state, model);
 
-    let mut last_res: Option<Response<hyper::body::Incoming>> = None;
-    for (idx, provider) in providers.iter().enumerate() {
-        let upstream_req = match provider {
-            crate::common::Provider::Opencode => crate::common::upstream_builder(
-                Method::POST,
-                format!("{}/chat/completions", crate::common::upstream_base()),
-                &session,
-            )
-            .body(full_body(body_bytes.clone()))?,
-            crate::common::Provider::Kilo => crate::common::kilo_builder(
-                Method::POST,
-                format!("{}/chat/completions", crate::common::kilo_base()),
-                &state.kilo_token,
-            )
-            .body(full_body(body_bytes.clone()))?,
-        };
-
-        match crate::common::do_upstream_request(&state, upstream_req).await {
-            Ok(res) => {
-                if res.status().is_success() || idx == providers.len() - 1 {
-                    last_res = Some(res);
-                    break;
-                }
-                let status = res.status();
-                if status == StatusCode::NOT_FOUND
-                    || status == StatusCode::BAD_REQUEST
-                    || status == StatusCode::TOO_MANY_REQUESTS
-                {
-                    eprintln!("{} provider failed for model {} with {}, trying fallback", provider.as_str(), model, status);
-                    last_res = Some(res);
-                    continue;
-                } else {
-                    last_res = Some(res);
-                    break;
-                }
-            }
-            Err(e) => {
-                if idx == providers.len() - 1 {
-                    return Err(e);
-                }
-                eprintln!("{} request failed: {e}, trying fallback", provider.as_str());
-                continue;
-            }
-        }
-    }
-
-    let mut upstream_res = last_res.unwrap();
-    if upstream_res.status() == StatusCode::TOO_MANY_REQUESTS && state.rotator.is_some() {
-        eprintln!("both providers rate-limited for {model}, trying via proxy");
-        for provider in &providers {
-            let proxy_req = match provider {
-                crate::common::Provider::Opencode => crate::common::upstream_builder(
-                    Method::POST,
-                    format!("{}/chat/completions", crate::common::upstream_base()),
-                    &session,
-                )
-                .body(full_body(body_bytes.clone()))?,
-                crate::common::Provider::Kilo => crate::common::kilo_builder(
-                    Method::POST,
-                    format!("{}/chat/completions", crate::common::kilo_base()),
-                    &state.kilo_token,
-                )
-                .body(full_body(body_bytes.clone()))?,
-            };
-            match crate::common::do_proxied_upstream_request(&state, proxy_req).await {
-                Ok(r) if r.status().is_success() => {
-                    upstream_res = r;
-                    break;
-                }
-                Ok(r) => {
-                    eprintln!("proxy via {} failed with {}", provider.as_str(), r.status());
-                    upstream_res = r;
-                }
-                Err(e) => eprintln!("proxy via {} failed: {e}", provider.as_str()),
-            }
-        }
-    }
+    let upstream_res =
+        crate::common::fetch_raw_with_fallback(&state, model, &session, &body_bytes).await?;
     let (parts, body) = upstream_res.into_parts();
     let mut builder = Response::builder().status(parts.status);
 
@@ -133,7 +57,7 @@ pub async fn handle_responses(req: Request<hyper::body::Incoming>, state: Arc<St
 
     let body_bytes = match read_body(req).await {
         crate::common::BodyRead::Data(b) => b,
-        crate::common::BodyRead::Respond(r) => return Ok(r),
+        crate::common::BodyRead::Fail(status, msg) => return Ok(error_res(status, msg)),
     };
     let body: Value = match serde_json::from_slice(&body_bytes) {
         Ok(v) => v,
@@ -178,113 +102,13 @@ pub async fn handle_responses(req: Request<hyper::body::Incoming>, state: Arc<St
         payload["stream_options"] = json!({"include_usage": true});
     }
 
-    let providers = crate::common::ordered_providers(&state, model);
-    let mut upstream_res: Option<Response<hyper::body::Incoming>> = None;
-    let mut last_status = StatusCode::BAD_GATEWAY;
-    let mut last_err_msg = String::new();
     let payload_bytes = serde_json::to_vec(&payload)?;
-
-    for (idx, provider) in providers.iter().enumerate() {
-        let req = match provider {
-            crate::common::Provider::Opencode => crate::common::upstream_builder(
-                Method::POST,
-                format!("{}/chat/completions", crate::common::upstream_base()),
-                &session,
-            )
-            .body(full_body(Bytes::from(payload_bytes.clone())))?,
-            crate::common::Provider::Kilo => crate::common::kilo_builder(
-                Method::POST,
-                format!("{}/chat/completions", crate::common::kilo_base()),
-                &state.kilo_token,
-            )
-            .body(full_body(Bytes::from(payload_bytes.clone())))?,
-        };
-
-        match crate::common::do_upstream_request(&state, req).await {
-            Ok(res) => {
-                let status = res.status();
-                if status.is_success() {
-                    upstream_res = Some(res);
-                    break;
-                }
-                let is_last = idx == providers.len() - 1;
-                let err_bytes = match res.into_body().collect().await {
-                    Ok(c) => c.to_bytes(),
-                    Err(_) => bytes::Bytes::new(),
-                };
-                let err: Value = serde_json::from_slice(&err_bytes).unwrap_or_else(|_| json!({}));
-                let msg = err["error"]["message"]
-                    .as_str()
-                    .or_else(|| err["message"].as_str())
-                    .unwrap_or("Upstream error")
-                    .to_string();
-                if !is_last
-                    && (status == StatusCode::NOT_FOUND
-                        || status == StatusCode::BAD_REQUEST
-                        || status == StatusCode::TOO_MANY_REQUESTS)
-                {
-                    eprintln!("{} provider failed for model {} with {}: {}, trying fallback", provider.as_str(), model, status, msg);
-                    last_status = status;
-                    last_err_msg = msg;
-                    continue;
-                } else {
-                    if status == StatusCode::TOO_MANY_REQUESTS && state.rotator.is_some() {
-                        eprintln!("rate-limited on {model}, trying via proxy");
-                        for p in &providers {
-                            let proxy_req = match p {
-                                crate::common::Provider::Opencode => crate::common::upstream_builder(
-                                    Method::POST,
-                                    format!("{}/chat/completions", crate::common::upstream_base()),
-                                    &session,
-                                )
-                                .body(full_body(Bytes::from(payload_bytes.clone())))?,
-                                crate::common::Provider::Kilo => crate::common::kilo_builder(
-                                    Method::POST,
-                                    format!("{}/chat/completions", crate::common::kilo_base()),
-                                    &state.kilo_token,
-                                )
-                                .body(full_body(Bytes::from(payload_bytes.clone())))?,
-                            };
-                            match crate::common::do_proxied_upstream_request(&state, proxy_req).await {
-                                Ok(r) if r.status().is_success() => {
-                                    upstream_res = Some(r);
-                                    break;
-                                }
-                                Ok(r) => eprintln!("proxy via {} failed with {}", p.as_str(), r.status()),
-                                Err(e) => eprintln!("proxy via {} failed: {e}", p.as_str()),
-                            }
-                        }
-                        if upstream_res.is_some() {
-                            break;
-                        }
-                    }
-                    return Ok(error_res(status, msg));
-                }
-            }
-            Err(e) => {
-                if idx == providers.len() - 1 {
-                    return Err(e);
-                }
-                eprintln!("{} request failed: {e}, trying fallback", provider.as_str());
-                last_status = StatusCode::BAD_GATEWAY;
-                last_err_msg = e.to_string();
-                continue;
-            }
-        }
-    }
-
-    let upstream_res = match upstream_res {
-        Some(r) => r,
-        None => return Ok(error_res(last_status, last_err_msg)),
-    };
+    let proxy_body = Bytes::from(payload_bytes);
+    let upstream_res =
+        crate::common::fetch_raw_with_fallback(&state, model, &session, &proxy_body).await?;
     let status = upstream_res.status();
     if !status.is_success() {
-        let err_bytes = upstream_res.into_body().collect().await?.to_bytes();
-        let err: Value = serde_json::from_slice(&err_bytes).unwrap_or_else(|_| json!({}));
-        let msg = err["error"]["message"]
-            .as_str()
-            .or_else(|| err["message"].as_str())
-            .unwrap_or("Upstream error");
+        let (status, msg) = crate::common::upstream_err_msg(upstream_res).await;
         return Ok(error_res(status, msg));
     }
 
@@ -292,11 +116,7 @@ pub async fn handle_responses(req: Request<hyper::body::Incoming>, state: Arc<St
         let full_body_bytes = upstream_res.into_body().collect().await?.to_bytes();
         let oai: Value = serde_json::from_slice(&full_body_bytes).unwrap_or(json!({}));
         let choice = &oai["choices"][0];
-        let text = choice["message"]["content"]
-            .as_str()
-            .or_else(|| choice["message"]["reasoning"].as_str())
-            .unwrap_or("")
-            .to_string();
+        let text = crate::common::message_text(&choice["message"]);
         let mut calls: Vec<(String, String, String)> = Vec::new();
         if let Some(tcs) = choice["message"]["tool_calls"].as_array() {
             for tc in tcs {
@@ -308,7 +128,9 @@ pub async fn handle_responses(req: Request<hyper::body::Incoming>, state: Arc<St
                 ));
             }
         }
-        let resp = build_response_object(model, "", "", &text, &calls, oai.get("usage"), "completed");
+        let resp_id = format!("resp_{}", rand_hex(16));
+        let msg_id = format!("msg_{}", rand_hex(12));
+        let resp = build_response_object(model, &resp_id, &msg_id, &text, &calls, oai.get("usage"), "completed");
         return Ok(json_res(StatusCode::OK, resp));
     }
 
@@ -355,6 +177,12 @@ fn convert_input(input: &Value, out: &mut Vec<Value>) {
                                 }
                             }]
                         }));
+                    }
+                    "reasoning" => {
+                        let text = parts_text(&item["summary"]);
+                        if !text.is_empty() {
+                            out.push(json!({"role": "assistant", "content": text}));
+                        }
                     }
                     "function_call_output" => {
                         let output = match &item["output"] {
@@ -419,11 +247,14 @@ fn usage_object(u: Option<&Value>) -> Value {
         .and_then(|u| u["prompt_tokens_details"]["cached_tokens"].as_u64())
         .unwrap_or(0);
     let output = u.and_then(|u| u["completion_tokens"].as_u64()).unwrap_or(0);
+    let reasoning = u
+        .and_then(|u| u["completion_tokens_details"]["reasoning_tokens"].as_u64())
+        .unwrap_or(0);
     json!({
         "input_tokens": input,
         "input_tokens_details": {"cached_tokens": cached},
         "output_tokens": output,
-        "output_tokens_details": {"reasoning_tokens": 0},
+        "output_tokens_details": {"reasoning_tokens": reasoning},
         "total_tokens": input + output
     })
 }
@@ -559,7 +390,7 @@ fn spawn_responses_stream(
                             continue;
                         };
 
-                        let txt_opt = choice.delta.content.clone().or_else(|| choice.delta.reasoning.clone());
+                        let txt_opt = crate::common::delta_text(&choice.delta);
                         if let Some(txt) = txt_opt {
                             if text_out.is_none() {
                                 text_item_id = format!("msg_{}", rand_hex(12));
@@ -634,7 +465,13 @@ fn spawn_responses_stream(
             calls.push((call_id.clone(), name.clone(), args.clone()));
         }
 
-        let final_msg_id = if text_item_id.is_empty() { "" } else { &text_item_id };
+        let fallback_msg_id;
+        let final_msg_id = if text_item_id.is_empty() {
+            fallback_msg_id = format!("msg_{}", rand_hex(12));
+            &fallback_msg_id
+        } else {
+            &text_item_id
+        };
         let final_obj = build_response_object(&model, &resp_id, final_msg_id, &text_acc, &calls, usage.as_ref(), "completed");
         send!(sse_frame("response.completed", &json!({"type": "response.completed", "response": final_obj})));
     });

@@ -64,9 +64,9 @@ async fn check_api_once(state: &State, proxy_url: &str) -> Result<(), Err> {
             let v: serde_json::Value = serde_json::from_slice(&bytes)?;
             let found = v["data"].as_array().is_some_and(|a| {
                 a.iter().any(|m| {
-                    m["id"].as_str().is_some_and(|id| {
-                        id == "big-pickle" || id.ends_with("-free")
-                    })
+                    m["id"]
+                        .as_str()
+                        .is_some_and(|id| id == "big-pickle" || id.ends_with("-free"))
                 })
             });
             if found {

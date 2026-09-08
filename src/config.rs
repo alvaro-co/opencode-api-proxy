@@ -1,5 +1,5 @@
 use crate::common::gen_api_key;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::{env, fs, path::Path};
 
 #[derive(Clone)]
@@ -40,16 +40,22 @@ pub fn read_file(path: &str) -> Option<Config> {
         enable_auth: val["enable_auth"].as_bool().unwrap_or(false),
         api_key: val["api_key"].as_str().unwrap_or("").to_string(),
         generated: false,
-        kilo_token: val["kilo_token"].as_str().unwrap_or("anonymous").to_string(),
-        kilo_enabled: val.get("kilo_enabled").and_then(|v| v.as_bool()).unwrap_or(true),
+        kilo_token: val["kilo_token"]
+            .as_str()
+            .unwrap_or("anonymous")
+            .to_string(),
+        kilo_enabled: val
+            .get("kilo_enabled")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true),
     })
 }
 
 pub fn write_file(path: &str, cfg: &Config) -> Result<(), String> {
-    if let Some(parent) = Path::new(path).parent() {
-        if !parent.as_os_str().is_empty() {
-            fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-        }
+    if let Some(parent) = Path::new(path).parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
     let body = json!({
         "enable_auth": cfg.enable_auth,
@@ -57,8 +63,11 @@ pub fn write_file(path: &str, cfg: &Config) -> Result<(), String> {
         "kilo_token": cfg.kilo_token,
         "kilo_enabled": cfg.kilo_enabled,
     });
-    fs::write(path, format!("{}\n", serde_json::to_string_pretty(&body).unwrap()))
-        .map_err(|e| e.to_string())?;
+    fs::write(
+        path,
+        format!("{}\n", serde_json::to_string_pretty(&body).unwrap()),
+    )
+    .map_err(|e| e.to_string())?;
 
     #[cfg(unix)]
     {
@@ -80,9 +89,14 @@ pub struct Cli {
     pub kilo_upstream: Option<String>,
     pub no_kilo: bool,
     pub proxies: Vec<String>,
-    pub proxy_file: Option<String>,
-    pub proxy_url: Option<String>,
+    pub proxy_files: Vec<String>,
+    pub proxy_urls: Vec<String>,
     pub proxy_interval: Option<u64>,
+    pub pool_file: Option<String>,
+    pub min_proxies: Option<usize>,
+    pub max_proxies: Option<usize>,
+    pub scrape_interval: Option<u64>,
+    pub no_auto_scrape: bool,
     pub help: bool,
     pub version: bool,
 }
@@ -94,7 +108,7 @@ Usage: opencode-api-proxy [OPTIONS]
 
 Options:
   -p, --port <PORT>       TCP port to listen on [default: 6446] [env: PORT]
-  -H, --host <HOST>       Address to bind [default: 0.0.0.0]
+  -H, --host <HOST>       Address to bind [default: [::] dual-stack, falls back to 0.0.0.0]
   -a, --auth              Require auth; generates a random API key and prints it
   -k, --api-key <KEY>     Require auth using this exact key (implies --auth)
   -c, --config <FILE>     Config file path [default: ./config.json] [env: CONFIG_FILE]
@@ -105,9 +119,14 @@ Options:
       --kilo-upstream <URL> Kilo upstream base [default: https://api.kilo.ai/api/openrouter] [env: KILO_UPSTREAM]
       --no-kilo           Disable Kilo provider (opencode only)
       --proxy <URL>       Add HTTP proxy for upstream (repeatable, e.g. http://ip:port or ip:port:user:pass)
-      --proxy-file <FILE> Load proxies from file (one per line, # for comments)
-      --proxy-url <URL>   Load proxies from URL
+      --proxy-file <FILE> Load proxies from file, repeatable (one per line, # for comments)
+      --proxy-url <URL>   Load proxies from URL, repeatable
       --proxy-interval <SECS> Proxy rotation interval [default: 900, min 60]
+      --pool-file <FILE>  Persist leased working pool (default: ./working_proxies.txt)
+      --min-proxies <N>   Start scraping below this many working proxies [default: 10]
+      --max-proxies <N>   Stop scraping at this many working proxies [default: 30]
+      --scrape-interval <SECS> Autopilot recheck interval [default: 300]
+      --no-auto-scrape    Disable background scrape+check (manual proxies only)
   -h, --help              Print this help
   -V, --version           Print version
 
@@ -123,6 +142,8 @@ Environment variables:
   KILO_TOKEN=token        Kilo auth token (KILO_AUTH_TOKEN also accepted)
   KILO_UPSTREAM=url       Kilo upstream base (KILO_BASE also accepted)
   KILO_ENABLED=true|false Enable/disable Kilo (default true)
+  UPSTREAM_TTFB=secs      Time to first upstream byte (default 30)
+  UPSTREAM_TOTAL=secs     Total upstream request budget (default 600)
 
 Endpoints:
   GET  /health                 Liveness + version + auth mode
@@ -185,11 +206,36 @@ pub fn parse_args() -> Result<Cli, String> {
                 cli.no_kilo = true;
             }
             "--proxy" => cli.proxies.push(value!("--proxy")?),
-            "--proxy-file" => cli.proxy_file = Some(value!("--proxy-file")?),
-            "--proxy-url" => cli.proxy_url = Some(value!("--proxy-url")?),
+            "--proxy-file" => cli.proxy_files.push(value!("--proxy-file")?),
+            "--proxy-url" => cli.proxy_urls.push(value!("--proxy-url")?),
             "--proxy-interval" => {
-                let v: u64 = value!("--proxy-interval")?.parse().map_err(|_| "invalid --proxy-interval")?;
+                let v: u64 = value!("--proxy-interval")?
+                    .parse()
+                    .map_err(|_| "invalid --proxy-interval")?;
                 cli.proxy_interval = Some(v);
+            }
+            "--pool-file" => cli.pool_file = Some(value!("--pool-file")?),
+            "--min-proxies" => {
+                let v: usize = value!("--min-proxies")?
+                    .parse()
+                    .map_err(|_| "invalid --min-proxies")?;
+                cli.min_proxies = Some(v);
+            }
+            "--max-proxies" => {
+                let v: usize = value!("--max-proxies")?
+                    .parse()
+                    .map_err(|_| "invalid --max-proxies")?;
+                cli.max_proxies = Some(v);
+            }
+            "--scrape-interval" => {
+                let v: u64 = value!("--scrape-interval")?
+                    .parse()
+                    .map_err(|_| "invalid --scrape-interval")?;
+                cli.scrape_interval = Some(v);
+            }
+            "--no-auto-scrape" => {
+                no_value!("--no-auto-scrape");
+                cli.no_auto_scrape = true;
             }
             "-h" | "--help" => {
                 no_value!("--help");
@@ -249,10 +295,10 @@ pub fn resolve(cli: &Cli) -> (Config, Option<String>) {
         cfg.enable_auth = true;
     }
 
-    if let Ok(t) = env::var("KILO_TOKEN").or_else(|_| env::var("KILO_AUTH_TOKEN")) {
-        if !t.is_empty() {
-            cfg.kilo_token = t;
-        }
+    if let Ok(t) = env::var("KILO_TOKEN").or_else(|_| env::var("KILO_AUTH_TOKEN"))
+        && !t.is_empty()
+    {
+        cfg.kilo_token = t;
     }
     if let Ok(v) = env::var("KILO_ENABLED") {
         cfg.kilo_enabled = !(v.eq_ignore_ascii_case("false") || v == "0");

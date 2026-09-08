@@ -1,9 +1,17 @@
-use crate::common::{full_body, kilo_auth_header, update_merged_models, Err, State, AUTH_HEADER, UA_HEADER};
-use hyper::header::AUTHORIZATION;
+use crate::common::{
+    AUTH_HEADER, Err, State, UA_HEADER, full_body, kilo_auth_header, update_merged_models,
+};
 use http_body_util::BodyExt;
+use hyper::header::AUTHORIZATION;
 use hyper::{Method, Request};
 use serde_json::Value;
-use std::{sync::{atomic::{AtomicBool, Ordering}, Arc}, time::{Duration, Instant}};
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::{Duration, Instant},
+};
 
 const REFRESH_INTERVAL: Duration = Duration::from_secs(3600);
 const RETRY_INTERVAL: Duration = Duration::from_secs(15);
@@ -20,10 +28,10 @@ fn is_kilo_free(item: &Value) -> bool {
     {
         return true;
     }
-    if let Some(name) = item.get("name").and_then(|v| v.as_str()) {
-        if name.to_lowercase().contains("(free)") {
-            return true;
-        }
+    if let Some(name) = item.get("name").and_then(|v| v.as_str())
+        && name.to_ascii_lowercase().contains("(free)")
+    {
+        return true;
     }
     false
 }
@@ -43,10 +51,10 @@ pub async fn fetch_opencode_models(state: &Arc<State>) -> Result<Vec<String>, Er
 
     if let Some(arr) = val["data"].as_array() {
         for item in arr {
-            if let Some(id) = item["id"].as_str() {
-                if id.ends_with("-free") || id == "big-pickle" || id == "big-picle" {
-                    list.push(id.to_string());
-                }
+            if let Some(id) = item["id"].as_str()
+                && (id.ends_with("-free") || id == "big-pickle" || id == "big-picle")
+            {
+                list.push(id.to_string());
             }
         }
     }
@@ -78,10 +86,10 @@ pub async fn fetch_kilo_models(state: &Arc<State>) -> Result<Vec<String>, Err> {
 
     if let Some(arr) = val["data"].as_array() {
         for item in arr {
-            if is_kilo_free(item) {
-                if let Some(id) = item["id"].as_str() {
-                    list.push(id.to_string());
-                }
+            if is_kilo_free(item)
+                && let Some(id) = item["id"].as_str()
+            {
+                list.push(id.to_string());
             }
         }
     }
@@ -130,7 +138,10 @@ pub fn spawn_refresher(state: Arc<State>) {
                     fails = 0;
                     if !announced {
                         announced = true;
-                        println!("  Opencode: {} free models (auto-refresh hourly)", list.len());
+                        println!(
+                            "  Opencode: {} free models (auto-refresh hourly)",
+                            list.len()
+                        );
                     }
                     announce_merged_once(&s1, &f1);
                     tokio::time::sleep(REFRESH_INTERVAL).await;

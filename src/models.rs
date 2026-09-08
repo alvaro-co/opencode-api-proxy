@@ -52,7 +52,7 @@ pub async fn fetch_opencode_models(state: &Arc<State>) -> Result<Vec<String>, Er
     if let Some(arr) = val["data"].as_array() {
         for item in arr {
             if let Some(id) = item["id"].as_str()
-                && (id.ends_with("-free") || id == "big-pickle" || id == "big-picle")
+                && (id.ends_with("-free") || id == "big-pickle")
             {
                 list.push(id.to_string());
             }

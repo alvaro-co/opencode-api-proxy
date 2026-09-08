@@ -65,7 +65,7 @@ async fn check_api_once(state: &State, proxy_url: &str) -> Result<(), Err> {
             let found = v["data"].as_array().is_some_and(|a| {
                 a.iter().any(|m| {
                     m["id"].as_str().is_some_and(|id| {
-                        id == "big-pickle" || id == "big-picle" || id.ends_with("-free")
+                        id == "big-pickle" || id.ends_with("-free")
                     })
                 })
             });

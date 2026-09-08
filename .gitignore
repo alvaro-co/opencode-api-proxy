@@ -1,1 +1,4 @@
 /target
+working_proxies.txt
+proxy_pool.txt
+*.log

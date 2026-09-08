@@ -1,21 +1,25 @@
 use crate::common::{
-    auth, error_res, get_session, json_res, rand_hex, read_body, sse_frame,
-    sse_response, BoxRes, Err, State, SseDelta,
+    BoxRes, Err, SseDelta, State, auth, error_res, get_session, json_res, rand_hex, read_body,
+    sse_frame, sse_response,
 };
 use bytes::{Bytes, BytesMut};
-use http_body_util::{combinators::BoxBody, BodyExt, StreamBody};
+use http_body_util::{BodyExt, StreamBody, combinators::BoxBody};
 use hyper::body::Frame;
 use hyper::header::{CACHE_CONTROL, CONTENT_TYPE};
 use hyper::{Request, Response, StatusCode};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::{
     collections::HashMap,
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
-use tokio_stream::{wrappers::ReceiverStream, StreamExt};
+use tokio_stream::{StreamExt, wrappers::ReceiverStream};
 
-pub async fn handle_chat_completions(req: Request<hyper::body::Incoming>, state: Arc<State>, peer: String) -> Result<BoxRes, Err> {
+pub async fn handle_chat_completions(
+    req: Request<hyper::body::Incoming>,
+    state: Arc<State>,
+    peer: String,
+) -> Result<BoxRes, Err> {
     if !auth(&state, &req) {
         return Ok(error_res(StatusCode::UNAUTHORIZED, "Invalid API key"));
     }
@@ -32,9 +36,17 @@ pub async fn handle_chat_completions(req: Request<hyper::body::Incoming>, state:
     let model = body_json["model"].as_str().unwrap_or("");
     let stream = body_json["stream"].as_bool().unwrap_or(false);
     let session = get_session(&state, &peer);
+    let deadline = tokio::time::Instant::now() + state.timeouts.total;
 
-    let upstream_res =
-        crate::common::fetch_raw_with_fallback(&state, model, &session, &body_bytes).await?;
+    let upstream_res = match tokio::time::timeout_at(
+        deadline,
+        crate::common::fetch_raw_with_fallback(&state, model, &session, &body_bytes),
+    )
+    .await
+    {
+        Ok(r) => r?,
+        Err(_) => return Ok(error_res(StatusCode::GATEWAY_TIMEOUT, "Upstream timed out")),
+    };
     let (parts, body) = upstream_res.into_parts();
     let mut builder = Response::builder().status(parts.status);
 
@@ -47,10 +59,17 @@ pub async fn handle_chat_completions(req: Request<hyper::body::Incoming>, state:
         builder = builder.header(CONTENT_TYPE, ct);
     }
 
-    Ok(builder.body(BoxBody::new(body.map_err(|e| Box::new(e) as Err)))?)
+    Ok(builder.body(crate::common::cap_stream(
+        BoxBody::new(body.map_err(|e| Box::new(e) as Err)),
+        deadline,
+    ))?)
 }
 
-pub async fn handle_responses(req: Request<hyper::body::Incoming>, state: Arc<State>, peer: String) -> Result<BoxRes, Err> {
+pub async fn handle_responses(
+    req: Request<hyper::body::Incoming>,
+    state: Arc<State>,
+    peer: String,
+) -> Result<BoxRes, Err> {
     if !auth(&state, &req) {
         return Ok(error_res(StatusCode::UNAUTHORIZED, "Invalid API key"));
     }
@@ -69,74 +88,153 @@ pub async fn handle_responses(req: Request<hyper::body::Incoming>, state: Arc<St
     let session = get_session(&state, &peer);
 
     let mut messages: Vec<Value> = Vec::new();
-    if let Some(instructions) = body["instructions"].as_str() {
-        if !instructions.is_empty() {
-            messages.push(json!({"role": "system", "content": instructions}));
-        }
+    if let Some(instructions) = body["instructions"].as_str()
+        && !instructions.is_empty()
+    {
+        messages.push(json!({"role": "system", "content": instructions}));
     }
     convert_input(&body["input"], &mut messages);
 
-    let mut payload = json!({"model": model, "messages": messages, "stream": stream});
+    let mut core = json!({"model": model, "messages": messages, "stream": stream});
     if let Some(tools) = convert_tools(body["tools"].as_array()) {
-        payload["tools"] = tools;
+        core["tools"] = tools;
     }
-    if let Some(tc) = body.get("tool_choice") {
-        if !tc.is_null() {
-            let mapped = map_tool_choice(tc);
-            if !mapped.is_null() {
-                payload["tool_choice"] = mapped;
-            }
-        }
-    }
-    for key in ["temperature", "top_p", "seed"] {
-        if let Some(v) = body.get(key) {
-            if !v.is_null() {
-                payload[key] = v.clone();
-            }
+    if let Some(tc) = body.get("tool_choice")
+        && !tc.is_null()
+    {
+        let mapped = map_tool_choice(tc);
+        if !mapped.is_null() {
+            core["tool_choice"] = mapped;
         }
     }
     if let Some(n) = body["max_output_tokens"].as_u64() {
-        payload["max_tokens"] = json!(n);
+        core["max_tokens"] = json!(n);
     }
     if stream {
-        payload["stream_options"] = json!({"include_usage": true});
+        core["stream_options"] = json!({"include_usage": true});
+    }
+    let mut payload = core.clone();
+    let mut had_extras = false;
+    if let (Some(src), Some(dst)) = (body.as_object(), payload.as_object_mut()) {
+        for (k, v) in src {
+            if !v.is_null() && !RESPONSES_CONSUMED.contains(&k.as_str()) {
+                dst.insert(k.clone(), v.clone());
+                had_extras = true;
+            }
+        }
     }
 
-    let payload_bytes = serde_json::to_vec(&payload)?;
-    let proxy_body = Bytes::from(payload_bytes);
-    let upstream_res =
-        crate::common::fetch_raw_with_fallback(&state, model, &session, &proxy_body).await?;
+    let deadline = tokio::time::Instant::now() + state.timeouts.total;
+    let fetch = |b: Bytes| {
+        let state = Arc::clone(&state);
+        let session = session.clone();
+        async move {
+            tokio::time::timeout_at(
+                deadline,
+                crate::common::fetch_raw_with_fallback(&state, model, &session, &b),
+            )
+            .await
+        }
+    };
+    let mut warn: Option<String> = None;
+    let mut upstream_res = match fetch(Bytes::from(serde_json::to_vec(&payload)?)).await {
+        Ok(r) => r?,
+        Err(_) => return Ok(error_res(StatusCode::GATEWAY_TIMEOUT, "Upstream timed out")),
+    };
     let status = upstream_res.status();
     if !status.is_success() {
-        let (status, msg) = crate::common::upstream_err_msg(upstream_res).await;
-        return Ok(error_res(status, msg));
+        let (st, msg) = crate::common::upstream_err_msg(upstream_res).await;
+        if st == StatusCode::BAD_REQUEST && had_extras {
+            let retry_res = match fetch(Bytes::from(serde_json::to_vec(&core)?)).await {
+                Ok(r) => r?,
+                Err(_) => {
+                    return Ok(error_res(StatusCode::GATEWAY_TIMEOUT, "Upstream timed out"));
+                }
+            };
+            if retry_res.status().is_success() {
+                warn = Some(crate::common::stripped_warning(&msg));
+                upstream_res = retry_res;
+            } else {
+                drop(retry_res);
+                return Ok(error_res(st, msg));
+            }
+        } else {
+            return Ok(error_res(st, msg));
+        }
     }
 
     if !stream {
-        let full_body_bytes = upstream_res.into_body().collect().await?.to_bytes();
+        let full_body_bytes =
+            match tokio::time::timeout_at(deadline, upstream_res.into_body().collect()).await {
+                Ok(Ok(c)) => c.to_bytes(),
+                _ => return Ok(error_res(StatusCode::GATEWAY_TIMEOUT, "Upstream timed out")),
+            };
         let oai: Value = serde_json::from_slice(&full_body_bytes).unwrap_or(json!({}));
         let choice = &oai["choices"][0];
-        let text = crate::common::message_text(&choice["message"]);
+        let text = oai_text(&choice["message"]);
+        let reasoning = oai_reasoning(&choice["message"]);
         let mut calls: Vec<(String, String, String)> = Vec::new();
         if let Some(tcs) = choice["message"]["tool_calls"].as_array() {
             for tc in tcs {
                 let cid = tc["id"].as_str().unwrap_or("");
                 calls.push((
-                    if cid.is_empty() { format!("call_{}", rand_hex(16)) } else { cid.to_string() },
+                    if cid.is_empty() {
+                        format!("call_{}", rand_hex(16))
+                    } else {
+                        cid.to_string()
+                    },
                     tc["function"]["name"].as_str().unwrap_or("").to_string(),
-                    tc["function"]["arguments"].as_str().unwrap_or("{}").to_string(),
+                    tc["function"]["arguments"]
+                        .as_str()
+                        .unwrap_or("{}")
+                        .to_string(),
                 ));
             }
         }
         let resp_id = format!("resp_{}", rand_hex(16));
         let msg_id = format!("msg_{}", rand_hex(12));
-        let resp = build_response_object(model, &resp_id, &msg_id, &text, &calls, oai.get("usage"), "completed");
-        return Ok(json_res(StatusCode::OK, resp));
+        let rs_id = format!("rs_{}", rand_hex(12));
+        let resp = build_response_object(ResponseBuild {
+            model,
+            resp_id: &resp_id,
+            msg_item_id: &msg_id,
+            text: &text,
+            rs_item_id: &rs_id,
+            reasoning: &reasoning,
+            calls: &calls,
+            usage: oai.get("usage"),
+            status: "completed",
+        });
+        return Ok(crate::common::with_warning(
+            json_res(StatusCode::OK, resp),
+            warn.as_deref(),
+        ));
     }
 
     let rx = spawn_responses_stream(upstream_res, model.to_string());
-    Ok(sse_response(StatusCode::OK).body(BoxBody::new(StreamBody::new(ReceiverStream::new(rx).map(|res| res.map(Frame::data)))))?)
+    Ok(crate::common::with_warning(
+        sse_response(StatusCode::OK).body(crate::common::cap_stream(
+            BoxBody::new(StreamBody::new(
+                ReceiverStream::new(rx).map(|res| res.map(Frame::data)),
+            )),
+            deadline,
+        ))?,
+        warn.as_deref(),
+    ))
 }
+
+const RESPONSES_CONSUMED: &[&str] = &[
+    "model",
+    "messages",
+    "stream",
+    "tools",
+    "tool_choice",
+    "input",
+    "instructions",
+    "max_output_tokens",
+    "stream_options",
+    "previous_response_id",
+];
 
 fn now_ts() -> u64 {
     SystemTime::now()
@@ -165,7 +263,10 @@ fn convert_input(input: &Value, out: &mut Vec<Value>) {
                 let itype = item["type"].as_str().unwrap_or("message");
                 match itype {
                     "function_call" => {
-                        let cid = item["call_id"].as_str().or_else(|| item["id"].as_str()).unwrap_or("");
+                        let cid = item["call_id"]
+                            .as_str()
+                            .or_else(|| item["id"].as_str())
+                            .unwrap_or("");
                         out.push(json!({
                             "role": "assistant",
                             "tool_calls": [{
@@ -179,7 +280,14 @@ fn convert_input(input: &Value, out: &mut Vec<Value>) {
                         }));
                     }
                     "reasoning" => {
-                        let text = parts_text(&item["summary"]);
+                        let mut text = parts_text(&item["summary"]);
+                        let extra = parts_text(&item["content"]);
+                        if !extra.is_empty() {
+                            if !text.is_empty() {
+                                text.push('\n');
+                            }
+                            text.push_str(&extra);
+                        }
                         if !text.is_empty() {
                             out.push(json!({"role": "assistant", "content": text}));
                         }
@@ -259,26 +367,38 @@ fn usage_object(u: Option<&Value>) -> Value {
     })
 }
 
-fn build_response_object(
-    model: &str,
-    resp_id: &str,
-    msg_item_id: &str,
-    text: &str,
-    calls: &[(String, String, String)],
-    usage: Option<&Value>,
-    status: &str,
-) -> Value {
-    let mut output = Vec::with_capacity(calls.len() + 1);
-    if !text.is_empty() || calls.is_empty() {
+struct ResponseBuild<'a> {
+    model: &'a str,
+    resp_id: &'a str,
+    msg_item_id: &'a str,
+    text: &'a str,
+    rs_item_id: &'a str,
+    reasoning: &'a str,
+    calls: &'a [(String, String, String)],
+    usage: Option<&'a Value>,
+    status: &'a str,
+}
+
+fn build_response_object(b: ResponseBuild<'_>) -> Value {
+    let mut output = Vec::with_capacity(b.calls.len() + 2);
+    if !b.reasoning.is_empty() {
         output.push(json!({
-            "id": msg_item_id,
+            "id": b.rs_item_id,
+            "type": "reasoning",
+            "summary": [{"type": "summary_text", "text": b.reasoning}],
+            "status": "completed"
+        }));
+    }
+    if !b.text.is_empty() || b.calls.is_empty() {
+        output.push(json!({
+            "id": b.msg_item_id,
             "type": "message",
             "status": "completed",
             "role": "assistant",
-            "content": [{"type": "output_text", "text": text, "annotations": []}]
+            "content": [{"type": "output_text", "text": b.text, "annotations": []}]
         }));
     }
-    for (call_id, name, args) in calls {
+    for (call_id, name, args) in b.calls {
         output.push(json!({
             "id": call_id,
             "type": "function_call",
@@ -290,18 +410,30 @@ fn build_response_object(
     }
 
     json!({
-        "id": resp_id,
+        "id": b.resp_id,
         "object": "response",
         "created_at": now_ts(),
-        "status": status,
-        "model": model,
+        "status": b.status,
+        "model": b.model,
         "output": output,
         "parallel_tool_calls": true,
         "error": null,
         "incomplete_details": null,
-        "usage": usage_object(usage),
+        "usage": usage_object(b.usage),
         "metadata": {}
     })
+}
+
+fn oai_text(msg: &Value) -> String {
+    msg["content"].as_str().unwrap_or("").to_string()
+}
+
+fn oai_reasoning(msg: &Value) -> String {
+    msg["reasoning"]
+        .as_str()
+        .or_else(|| msg["reasoning_content"].as_str())
+        .unwrap_or("")
+        .to_string()
 }
 
 async fn close_text_block(
@@ -332,6 +464,28 @@ async fn close_text_block(
     *text_out = None;
 }
 
+async fn close_reasoning_block(
+    tx: &tokio::sync::mpsc::Sender<Result<Bytes, Err>>,
+    reason_out: &mut Option<usize>,
+    item_id: &str,
+    acc: &str,
+) {
+    let Some(idx) = *reason_out else { return };
+    let _ = tx
+        .send(Ok(sse_frame(
+            "response.reasoning_summary_text.done",
+            &json!({"type": "response.reasoning_summary_text.done", "item_id": item_id, "output_index": idx, "summary_index": 0, "text": acc}),
+        )))
+        .await;
+    let _ = tx
+        .send(Ok(sse_frame(
+            "response.output_item.done",
+            &json!({"type": "response.output_item.done", "output_index": idx, "item": {"id": item_id, "type": "reasoning", "summary": [{"type": "summary_text", "text": acc}], "status": "completed"}}),
+        )))
+        .await;
+    *reason_out = None;
+}
+
 fn spawn_responses_stream(
     upstream_res: Response<hyper::body::Incoming>,
     model: String,
@@ -349,12 +503,28 @@ fn spawn_responses_stream(
         }
 
         let created = {
-            let mut obj = build_response_object(&model, &resp_id, "", "", &[], None, "in_progress");
+            let mut obj = build_response_object(ResponseBuild {
+                model: &model,
+                resp_id: &resp_id,
+                msg_item_id: "",
+                text: "",
+                rs_item_id: "",
+                reasoning: "",
+                calls: &[],
+                usage: None,
+                status: "in_progress",
+            });
             obj["output"] = json!([]);
             obj
         };
-        send!(sse_frame("response.created", &json!({"type": "response.created", "response": created})));
-        send!(sse_frame("response.in_progress", &json!({"type": "response.in_progress", "response": created})));
+        send!(sse_frame(
+            "response.created",
+            &json!({"type": "response.created", "response": created})
+        ));
+        send!(sse_frame(
+            "response.in_progress",
+            &json!({"type": "response.in_progress", "response": created})
+        ));
 
         let mut body = upstream_res.into_body();
         let mut buffer = BytesMut::with_capacity(1024);
@@ -363,83 +533,135 @@ fn spawn_responses_stream(
         let mut text_out: Option<usize> = None;
         let mut text_item_id = String::new();
         let mut text_acc = String::new();
-        // tc index -> (output_index, item_id, call_id, name, args)
+        let mut reason_out: Option<usize> = None;
+        let mut reason_item_id = String::new();
+        let mut reason_acc = String::new();
+
         let mut tools: HashMap<i64, (usize, String, String, String, String)> = HashMap::new();
         let mut usage: Option<Value> = None;
 
         while let Some(frame_res) = body.frame().await {
-            if let Ok(frame) = frame_res {
-                if let Ok(chunk) = frame.into_data() {
-                    buffer.extend_from_slice(&chunk);
+            if let Ok(frame) = frame_res
+                && let Ok(chunk) = frame.into_data()
+            {
+                buffer.extend_from_slice(&chunk);
 
-                    while let Some(pos) = memchr::memchr(b'\n', &buffer) {
-                        let line_bytes = buffer.split_to(pos + 1);
-                        let trimmed = line_bytes.trim_ascii();
+                while let Some(pos) = memchr::memchr(b'\n', &buffer) {
+                    let line_bytes = buffer.split_to(pos + 1);
+                    let trimmed = line_bytes.trim_ascii();
 
-                        if !trimmed.starts_with(b"data: ") || trimmed.ends_with(b"[DONE]") {
-                            continue;
-                        }
+                    if !trimmed.starts_with(b"data: ") || trimmed.ends_with(b"[DONE]") {
+                        continue;
+                    }
 
-                        let Ok(v) = serde_json::from_slice::<SseDelta>(&trimmed[6..]) else {
-                            continue;
-                        };
-                        if v.usage.is_some() {
-                            usage = v.usage.clone();
-                        }
-                        let Some(choice) = v.choices.first() else {
-                            continue;
-                        };
+                    let Ok(v) = serde_json::from_slice::<SseDelta>(&trimmed[6..]) else {
+                        continue;
+                    };
+                    if v.usage.is_some() {
+                        usage = v.usage.clone();
+                    }
+                    let Some(choice) = v.choices.first() else {
+                        continue;
+                    };
 
-                        let txt_opt = crate::common::delta_text(&choice.delta);
-                        if let Some(txt) = txt_opt {
-                            if text_out.is_none() {
-                                text_item_id = format!("msg_{}", rand_hex(12));
-                                let idx = next_out;
-                                next_out += 1;
-                                text_out = Some(idx);
-                                send!(sse_frame(
-                                    "response.output_item.added",
-                                    &json!({"type": "response.output_item.added", "output_index": idx, "item": {"id": text_item_id, "type": "message", "status": "in_progress", "role": "assistant", "content": []}})
-                                ));
-                                send!(sse_frame(
-                                    "response.content_part.added",
-                                    &json!({"type": "response.content_part.added", "item_id": text_item_id, "output_index": idx, "content_index": 0, "part": {"type": "output_text", "text": "", "annotations": []}})
-                                ));
-                            }
-                            let idx = text_out.unwrap_or(0);
-                            text_acc.push_str(&txt);
+                    if let Some(txt) = choice.delta.content.clone() {
+                        if text_out.is_none() {
+                            text_item_id = format!("msg_{}", rand_hex(12));
+                            let idx = next_out;
+                            next_out += 1;
+                            text_out = Some(idx);
                             send!(sse_frame(
-                                "response.output_text.delta",
-                                &json!({"type": "response.output_text.delta", "item_id": text_item_id, "output_index": idx, "content_index": 0, "delta": txt})
+                                "response.output_item.added",
+                                &json!({"type": "response.output_item.added", "output_index": idx, "item": {"id": text_item_id, "type": "message", "status": "in_progress", "role": "assistant", "content": []}})
+                            ));
+                            send!(sse_frame(
+                                "response.content_part.added",
+                                &json!({"type": "response.content_part.added", "item_id": text_item_id, "output_index": idx, "content_index": 0, "part": {"type": "output_text", "text": "", "annotations": []}})
                             ));
                         }
+                        let idx = text_out.unwrap_or(0);
+                        text_acc.push_str(&txt);
+                        send!(sse_frame(
+                            "response.output_text.delta",
+                            &json!({"type": "response.output_text.delta", "item_id": text_item_id, "output_index": idx, "content_index": 0, "delta": txt})
+                        ));
+                    }
 
-                        if let Some(tcs) = &choice.delta.tool_calls {
-                            for tc in tcs {
-                                let tci = tc.index.unwrap_or(0);
-                                if let std::collections::hash_map::Entry::Vacant(e) = tools.entry(tci) {
-                                    close_text_block(&tx, &mut text_out, &text_item_id, &text_acc).await;
-                                    let call_id = tc.id.clone().unwrap_or_else(|| format!("call_{}", rand_hex(16)));
-                                    let item_id = format!("fc_{}", rand_hex(12));
-                                    let name = tc.function.as_ref().and_then(|f| f.name.clone()).unwrap_or_default();
-                                    let out_idx = next_out;
-                                    next_out += 1;
-                                    e.insert((out_idx, item_id.clone(), call_id.clone(), name.clone(), String::new()));
-                                    send!(sse_frame(
-                                        "response.output_item.added",
-                                        &json!({"type": "response.output_item.added", "output_index": out_idx, "item": {"id": item_id, "type": "function_call", "status": "in_progress", "call_id": call_id, "name": name, "arguments": ""}})
-                                    ));
-                                }
+                    let reason_opt = choice
+                        .delta
+                        .reasoning
+                        .clone()
+                        .or_else(|| choice.delta.reasoning_content.clone());
+                    if let Some(txt) = reason_opt {
+                        if reason_out.is_none() {
+                            reason_item_id = format!("rs_{}", rand_hex(12));
+                            let idx = next_out;
+                            next_out += 1;
+                            reason_out = Some(idx);
+                            send!(sse_frame(
+                                "response.output_item.added",
+                                &json!({"type": "response.output_item.added", "output_index": idx, "item": {"id": reason_item_id, "type": "reasoning", "summary": []}})
+                            ));
+                            send!(sse_frame(
+                                "response.reasoning_summary_part.added",
+                                &json!({"type": "response.reasoning_summary_part.added", "item_id": reason_item_id, "output_index": idx, "summary_index": 0, "part": {"type": "summary_text", "text": ""}})
+                            ));
+                        }
+                        let idx = reason_out.unwrap_or(0);
+                        reason_acc.push_str(&txt);
+                        send!(sse_frame(
+                            "response.reasoning_summary_text.delta",
+                            &json!({"type": "response.reasoning_summary_text.delta", "item_id": reason_item_id, "output_index": idx, "summary_index": 0, "delta": txt})
+                        ));
+                    }
 
-                                if let Some((out_idx, item_id, _, _, args_acc)) = tools.get_mut(&tci) {
-                                    if let Some(frag) = tc.function.as_ref().and_then(|f| f.arguments.clone()) {
-                                        args_acc.push_str(&frag);
-                                        send!(sse_frame(
-                                            "response.function_call_arguments.delta",
-                                            &json!({"type": "response.function_call_arguments.delta", "item_id": item_id, "output_index": *out_idx, "delta": frag})
-                                        ));
-                                    }
-                                }
+                    if let Some(tcs) = &choice.delta.tool_calls {
+                        for tc in tcs {
+                            let tci = tc.index.unwrap_or(0);
+                            if let std::collections::hash_map::Entry::Vacant(e) = tools.entry(tci) {
+                                close_reasoning_block(
+                                    &tx,
+                                    &mut reason_out,
+                                    &reason_item_id,
+                                    &reason_acc,
+                                )
+                                .await;
+                                close_text_block(&tx, &mut text_out, &text_item_id, &text_acc)
+                                    .await;
+                                let call_id = tc
+                                    .id
+                                    .clone()
+                                    .unwrap_or_else(|| format!("call_{}", rand_hex(16)));
+                                let item_id = format!("fc_{}", rand_hex(12));
+                                let name = tc
+                                    .function
+                                    .as_ref()
+                                    .and_then(|f| f.name.clone())
+                                    .unwrap_or_default();
+                                let out_idx = next_out;
+                                next_out += 1;
+                                e.insert((
+                                    out_idx,
+                                    item_id.clone(),
+                                    call_id.clone(),
+                                    name.clone(),
+                                    String::new(),
+                                ));
+                                send!(sse_frame(
+                                    "response.output_item.added",
+                                    &json!({"type": "response.output_item.added", "output_index": out_idx, "item": {"id": item_id, "type": "function_call", "status": "in_progress", "call_id": call_id, "name": name, "arguments": ""}})
+                                ));
+                            }
+
+                            if let Some((out_idx, item_id, _, _, args_acc)) = tools.get_mut(&tci)
+                                && let Some(frag) =
+                                    tc.function.as_ref().and_then(|f| f.arguments.clone())
+                            {
+                                args_acc.push_str(&frag);
+                                send!(sse_frame(
+                                    "response.function_call_arguments.delta",
+                                    &json!({"type": "response.function_call_arguments.delta", "item_id": item_id, "output_index": *out_idx, "delta": frag})
+                                ));
                             }
                         }
                     }
@@ -447,9 +669,11 @@ fn spawn_responses_stream(
             }
         }
 
+        close_reasoning_block(&tx, &mut reason_out, &reason_item_id, &reason_acc).await;
         close_text_block(&tx, &mut text_out, &text_item_id, &text_acc).await;
 
-        let mut done_tools: Vec<(usize, String, String, String, String)> = tools.into_values().collect();
+        let mut done_tools: Vec<(usize, String, String, String, String)> =
+            tools.into_values().collect();
         done_tools.sort_by_key(|t| t.0);
 
         let mut calls: Vec<(String, String, String)> = Vec::with_capacity(done_tools.len());
@@ -472,8 +696,28 @@ fn spawn_responses_stream(
         } else {
             &text_item_id
         };
-        let final_obj = build_response_object(&model, &resp_id, final_msg_id, &text_acc, &calls, usage.as_ref(), "completed");
-        send!(sse_frame("response.completed", &json!({"type": "response.completed", "response": final_obj})));
+        let fallback_rs_id;
+        let final_rs_id = if reason_item_id.is_empty() {
+            fallback_rs_id = format!("rs_{}", rand_hex(12));
+            &fallback_rs_id
+        } else {
+            &reason_item_id
+        };
+        let final_obj = build_response_object(ResponseBuild {
+            model: &model,
+            resp_id: &resp_id,
+            msg_item_id: final_msg_id,
+            text: &text_acc,
+            rs_item_id: final_rs_id,
+            reasoning: &reason_acc,
+            calls: &calls,
+            usage: usage.as_ref(),
+            status: "completed",
+        });
+        send!(sse_frame(
+            "response.completed",
+            &json!({"type": "response.completed", "response": final_obj})
+        ));
     });
 
     rx

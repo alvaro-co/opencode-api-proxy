@@ -1,16 +1,18 @@
 use bytes::{BufMut, Bytes, BytesMut};
-use http_body_util::{BodyExt, Full, Limited, combinators::BoxBody};
+use http_body_util::{combinators::BoxBody, BodyExt, Full, Limited};
 use hyper::body::Incoming;
-use hyper::header::{AUTHORIZATION, CONTENT_TYPE, HeaderValue};
+use hyper::header::{HeaderValue, AUTHORIZATION, CONTENT_TYPE};
 use hyper::{Method, Request, Response, StatusCode};
 use parking_lot::RwLock;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::{
     collections::HashMap,
     fmt::Write as FmtWrite,
     io::Write as IoWrite,
-    sync::Arc,
-    sync::atomic::Ordering,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -20,72 +22,47 @@ pub type BoxRes = Response<BoxBody<Bytes, Err>>;
 pub const MAX_BODY_SIZE: usize = 10 * 1024 * 1024;
 pub const SESSION_TTL: u64 = 1800;
 
-#[derive(Clone, Copy)]
-pub struct Timeouts {
-    pub ttfb: Duration,
-    pub total: Duration,
-}
-
-impl Timeouts {
-    pub fn from_env() -> Self {
-        let secs = |name: &str, def: u64| {
-            std::env::var(name)
-                .ok()
-                .and_then(|v| v.parse::<u64>().ok())
-                .filter(|&n| n > 0)
-                .unwrap_or(def)
-        };
-        let ttfb = Duration::from_secs(secs("UPSTREAM_TTFB", 30));
-        let total = Duration::from_secs(secs("UPSTREAM_TOTAL", 600)).max(ttfb);
-        Self { ttfb, total }
-    }
-}
-
-pub static UA_HEADER: HeaderValue =
-    HeaderValue::from_static("opencode/1.15.0 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.13");
+// OpenCode v2 identifies its own client by this three-part User-Agent shape; the
+// free-tier gate rejects anything else (and Cloudflare rejects requests without it).
+pub static UA_HEADER: HeaderValue = HeaderValue::from_static("opencode/stable/2.0.32/cli");
 pub static AUTH_HEADER: HeaderValue = HeaderValue::from_static("Bearer public");
 pub static JSON_HEADER: HeaderValue = HeaderValue::from_static("application/json");
 
 pub const UPSTREAM_BASE_DEFAULT: &str = "https://opencode.ai/zen/v1";
 pub const KILO_BASE_DEFAULT: &str = "https://api.kilo.ai/api/openrouter";
+pub const MODELS_DEV_URL: &str = "https://models.dev/api.json";
 
-#[derive(Default)]
-pub struct Stats {
-    pub direct_ok: std::sync::atomic::AtomicU64,
-    pub fallback_triggers: std::sync::atomic::AtomicU64,
-    pub proxied_ok: std::sync::atomic::AtomicU64,
-    pub retry429_ok: std::sync::atomic::AtomicU64,
-    pub proxy_discards: std::sync::atomic::AtomicU64,
-}
+/// Tool names the OpenCode v2 free-tier gate expects in every request. When a
+/// caller does not declare them the proxy adds inert placeholders that are
+/// filtered out of the response again.
+pub const GATE_TOOLS: [&str; 6] = ["bash", "glob", "grep", "read", "edit", "write"];
 
-impl Stats {
-    pub fn snapshot(&self) -> serde_json::Value {
-        serde_json::json!({
-            "direct_ok": self.direct_ok.load(Ordering::Relaxed),
-            "fallback_triggers": self.fallback_triggers.load(Ordering::Relaxed),
-            "proxied_ok": self.proxied_ok.load(Ordering::Relaxed),
-            "retry429_ok": self.retry429_ok.load(Ordering::Relaxed),
-            "proxy_discards": self.proxy_discards.load(Ordering::Relaxed),
-        })
-    }
+#[derive(Clone, Copy, Default)]
+pub struct ModelMeta {
+    pub free: bool,
+    pub context: u64,
+    pub output: u64,
 }
 
 pub struct State {
-    pub client: HttpsClient,
+    pub client: hyper_util::client::legacy::Client<
+        hyper_rustls::HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>,
+        BoxBody<Bytes, Err>,
+    >,
     pub enable_auth: bool,
     pub api_key: String,
     pub sessions: RwLock<HashMap<String, (String, u64)>>,
     pub models: RwLock<Arc<Vec<String>>>,
     pub opencode_models: RwLock<Arc<Vec<String>>>,
     pub kilo_models: RwLock<Arc<Vec<String>>>,
+    pub model_meta: RwLock<Arc<HashMap<String, ModelMeta>>>,
+    pub kilo_meta: RwLock<Arc<HashMap<String, ModelMeta>>>,
     pub notify: tokio::sync::Notify,
     pub opencode_base: String,
     pub kilo_base: String,
     pub kilo_token: String,
     pub kilo_enabled: bool,
     pub rotator: Option<Arc<crate::rotator::ProxyRotator>>,
-    pub stats: Stats,
-    pub timeouts: Timeouts,
 }
 
 impl State {
@@ -108,24 +85,6 @@ pub fn full_body(bytes: Bytes) -> BoxBody<Bytes, Err> {
     BoxBody::new(Full::new(bytes).map_err(|e| match e {}))
 }
 
-pub fn cap_stream(
-    body: BoxBody<Bytes, Err>,
-    deadline: tokio::time::Instant,
-) -> BoxBody<Bytes, Err> {
-    let (tx, rx) = tokio::sync::mpsc::channel::<Result<hyper::body::Frame<Bytes>, Err>>(64);
-    tokio::spawn(async move {
-        let mut body = body;
-        while let Ok(Some(Ok(f))) = tokio::time::timeout_at(deadline, body.frame()).await {
-            if tx.send(Ok(f)).await.is_err() {
-                break;
-            }
-        }
-    });
-    BoxBody::new(http_body_util::StreamBody::new(
-        tokio_stream::wrappers::ReceiverStream::new(rx),
-    ))
-}
-
 pub fn json_res(status: StatusCode, val: Value) -> BoxRes {
     let bytes = serde_json::to_vec(&val).unwrap_or_default();
     Response::builder()
@@ -137,25 +96,6 @@ pub fn json_res(status: StatusCode, val: Value) -> BoxRes {
 
 pub fn error_res(status: StatusCode, message: impl Into<String>) -> BoxRes {
     json_res(status, json!({"error": {"message": message.into()}}))
-}
-
-pub fn with_warning(res: BoxRes, warn: Option<&str>) -> BoxRes {
-    let Some(w) = warn else {
-        return res;
-    };
-    let mut res = res;
-    if let Ok(v) = hyper::header::HeaderValue::from_str(&format!("299 ocproxy \"{w}\"")) {
-        res.headers_mut().insert(hyper::header::WARNING, v);
-    }
-    res
-}
-
-pub fn stripped_warning(msg: &str) -> String {
-    let clean: String = msg.chars().filter(|c| !c.is_control()).take(160).collect();
-    format!(
-        "retried without vendor extensions after upstream 400: {}",
-        clean.replace('"', "'")
-    )
 }
 
 pub fn anthropic_error(status: StatusCode, err_type: &str, message: impl Into<String>) -> BoxRes {
@@ -230,10 +170,10 @@ pub fn get_session(state: &State, user: &str) -> String {
     let now = now_secs();
     {
         let lock = state.sessions.read();
-        if let Some((id, ts)) = lock.get(user)
-            && now.saturating_sub(*ts) < SESSION_TTL
-        {
-            return id.clone();
+        if let Some((id, ts)) = lock.get(user) {
+            if now.saturating_sub(*ts) < SESSION_TTL {
+                return id.clone();
+            }
         }
     }
     let mut lock = state.sessions.write();
@@ -254,15 +194,29 @@ pub fn rand_hex(n: usize) -> String {
         .collect()
 }
 
+static OC_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Canonical OpenCode ID generator. IDs look like `ses_0a1b2c3d4e5fAbCdEfGhIjKlMn`
+/// with a 48-bit packed timestamp+counter (inverted for sessions) followed by 14
+/// random base62 characters. The free-tier gate validates this shape, so IDs we
+/// send upstream must not be arbitrary strings.
 pub fn oc_id(prefix: &str) -> String {
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
-        .as_millis();
-    let mut s = String::with_capacity(prefix.len() + 30);
-    let _ = write!(s, "{}_{:x}", prefix, ts);
-    s.push_str(&rand_alnum(12));
+        .as_millis() as u64;
+    let seq = OC_SEQ.fetch_add(1, Ordering::Relaxed) & 0xFFF;
+    let n = ts.wrapping_mul(4096).wrapping_add(seq);
+    let raw = n & 0xFFFF_FFFF_FFFF;
+    let val = if prefix == "ses" { !raw & 0xFFFF_FFFF_FFFF } else { raw };
+    let mut s = String::with_capacity(prefix.len() + 28);
+    let _ = write!(s, "{prefix}_{val:012x}");
+    s.push_str(&rand_alnum(14));
     s
+}
+
+pub fn unix_now() -> u64 {
+    now_secs()
 }
 
 pub fn gen_api_key() -> String {
@@ -352,32 +306,205 @@ pub struct SseFunction {
     pub arguments: Option<String>,
 }
 
-pub fn upstream_builder(
-    method: Method,
-    uri: String,
-    session: &str,
-) -> hyper::http::request::Builder {
+pub fn ensure_gate_tools(payload: &mut Value) -> Vec<String> {
+    let mut tools = payload["tools"].as_array().cloned().unwrap_or_default();
+    let mut names: std::collections::HashSet<String> = tools
+        .iter()
+        .filter_map(|t| t["function"]["name"].as_str().map(str::to_string))
+        .collect();
+    let mut injected = Vec::new();
+    for name in GATE_TOOLS {
+        if names.insert(name.to_string()) {
+            tools.push(json!({
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": "Do not call this tool. It exists only for API compatibility and must never be invoked.",
+                    "parameters": {"type": "object", "properties": {}}
+                }
+            }));
+            injected.push(name.to_string());
+        }
+    }
+    if !tools.is_empty() {
+        payload["tools"] = json!(tools);
+    }
+    injected
+}
+
+#[derive(Default, Clone)]
+pub struct ToolAgg {
+    pub id: String,
+    pub name: String,
+    pub arguments: String,
+}
+
+#[derive(Default)]
+pub struct ChatAgg {
+    pub id: Option<String>,
+    pub created: Option<u64>,
+    pub model: Option<String>,
+    pub content: String,
+    pub reasoning: String,
+    pub reasoning_field: Option<String>,
+    pub calls: Vec<(i64, ToolAgg)>,
+    pub usage: Option<Value>,
+    pub finish_reason: Option<String>,
+}
+
+/// Consume an upstream OpenAI-compatible SSE stream and reassemble it into a
+/// single completion. The upstream stream is always requested even when the
+/// caller wants a non-streaming answer, because the gate requires `stream:true`.
+pub async fn aggregate_sse(res: Response<Incoming>) -> Result<ChatAgg, Err> {
+    let mut agg = ChatAgg::default();
+    let mut body = res.into_body();
+    let mut buffer = BytesMut::with_capacity(1024);
+    while let Some(frame) = body.frame().await {
+        let frame = frame?;
+        let Ok(chunk) = frame.into_data() else { continue };
+        buffer.extend_from_slice(&chunk);
+        while let Some(pos) = memchr::memchr(b'\n', &buffer) {
+            let line = buffer.split_to(pos + 1);
+            let trimmed = line.trim_ascii();
+            if !trimmed.starts_with(b"data: ") || trimmed.ends_with(b"[DONE]") {
+                continue;
+            }
+            let Ok(v) = serde_json::from_slice::<Value>(&trimmed[6..]) else { continue };
+            if let Some(id) = v["id"].as_str() {
+                if agg.id.is_none() {
+                    agg.id = Some(id.to_string());
+                }
+            }
+            if let Some(created) = v["created"].as_u64() {
+                agg.created = Some(created);
+            }
+            if let Some(model) = v["model"].as_str() {
+                agg.model = Some(model.to_string());
+            }
+            if v["usage"].is_object() {
+                agg.usage = Some(v["usage"].clone());
+            }
+            let Some(choice) = v["choices"].get(0) else { continue };
+            let delta = &choice["delta"];
+            if let Some(c) = delta["content"].as_str() {
+                agg.content.push_str(c);
+            }
+            if let Some(r) = delta["reasoning"].as_str() {
+                agg.reasoning_field = Some("reasoning".to_string());
+                agg.reasoning.push_str(r);
+            } else if let Some(r) = delta["reasoning_content"].as_str() {
+                agg.reasoning_field = Some("reasoning_content".to_string());
+                agg.reasoning.push_str(r);
+            }
+            if let Some(tcs) = delta["tool_calls"].as_array() {
+                for tc in tcs {
+                    let idx = tc["index"].as_i64().unwrap_or(0);
+                    if !agg.calls.iter().any(|(i, _)| *i == idx) {
+                        agg.calls.push((idx, ToolAgg::default()));
+                    }
+                    let entry = &mut agg.calls.iter_mut().find(|(i, _)| *i == idx).unwrap().1;
+                    if let Some(id) = tc["id"].as_str() {
+                        if entry.id.is_empty() {
+                            entry.id = id.to_string();
+                        }
+                    }
+                    if let Some(name) = tc["function"]["name"].as_str() {
+                        entry.name = name.to_string();
+                    }
+                    if let Some(args) = tc["function"]["arguments"].as_str() {
+                        entry.arguments.push_str(args);
+                    }
+                }
+            }
+            if let Some(fr) = choice["finish_reason"].as_str() {
+                agg.finish_reason = Some(fr.to_string());
+            }
+        }
+    }
+    agg.calls.sort_by_key(|(i, _)| *i);
+    Ok(agg)
+}
+
+/// Build a non-streaming OpenAI chat.completion from an aggregated upstream
+/// stream, dropping any tool calls that were only injected for the gate.
+pub fn agg_to_oai(agg: &ChatAgg, skip: &[String]) -> Value {
+    let calls: Vec<Value> = agg
+        .calls
+        .iter()
+        .filter(|(_, c)| !c.name.is_empty() && !skip.contains(&c.name))
+        .map(|(_, c)| {
+            json!({
+                "id": if c.id.is_empty() { format!("call_{}", rand_hex(16)) } else { c.id.clone() },
+                "type": "function",
+                "function": {
+                    "name": c.name,
+                    "arguments": if c.arguments.is_empty() { "{}".to_string() } else { c.arguments.clone() }
+                }
+            })
+        })
+        .collect();
+    let mut message = json!({"role": "assistant"});
+    message["content"] = if agg.content.is_empty() && !calls.is_empty() {
+        Value::Null
+    } else {
+        json!(agg.content)
+    };
+    if !agg.reasoning.is_empty() {
+        message["reasoning_content"] = json!(agg.reasoning);
+        if agg.reasoning_field.as_deref() == Some("reasoning") {
+            message["reasoning"] = json!(agg.reasoning);
+        }
+    }
+    if !calls.is_empty() {
+        message["tool_calls"] = json!(calls);
+    }
+    let finish_reason = match agg.finish_reason.as_deref() {
+        Some("tool_calls") if calls.is_empty() => "stop",
+        Some(fr) => fr,
+        None => "stop",
+    };
+    json!({
+        "id": agg.id.clone().unwrap_or_else(|| format!("chatcmpl-{}", rand_hex(16))),
+        "object": "chat.completion",
+        "created": agg.created.unwrap_or_else(unix_now),
+        "model": agg.model.clone().unwrap_or_default(),
+        "choices": [{
+            "index": 0,
+            "message": message,
+            "finish_reason": finish_reason
+        }],
+        "usage": agg.usage.clone().unwrap_or_else(|| json!({
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0
+        }))
+    })
+}
+
+pub fn upstream_builder(method: Method, uri: String, session: &str) -> hyper::http::request::Builder {
     Request::builder()
         .method(method)
         .uri(uri)
         .header(CONTENT_TYPE, JSON_HEADER.clone())
         .header(AUTHORIZATION, AUTH_HEADER.clone())
         .header("User-Agent", UA_HEADER.clone())
+        .header("Accept", "text/event-stream")
         .header("x-opencode-client", "cli")
         .header("x-opencode-project", "global")
         .header("x-opencode-request", oc_id("msg"))
         .header("x-opencode-session", session)
+        .header("x-opencode-session-id", session)
+        .header("x-session-affinity", session)
+        .header("X-Session-Id", session)
 }
 
 pub fn kilo_auth_header(token: &str) -> HeaderValue {
     if token.is_empty() || token == "anonymous" {
         HeaderValue::from_static("Bearer anonymous")
     } else if token.starts_with("Bearer ") {
-        HeaderValue::from_str(token)
-            .unwrap_or_else(|_| HeaderValue::from_static("Bearer anonymous"))
+        HeaderValue::from_str(token).unwrap_or_else(|_| HeaderValue::from_static("Bearer anonymous"))
     } else {
-        HeaderValue::from_str(&format!("Bearer {token}"))
-            .unwrap_or_else(|_| HeaderValue::from_static("Bearer anonymous"))
+        HeaderValue::from_str(&format!("Bearer {token}")).unwrap_or_else(|_| HeaderValue::from_static("Bearer anonymous"))
     }
 }
 
@@ -389,74 +516,8 @@ pub fn kilo_builder(method: Method, uri: String, token: &str) -> hyper::http::re
         .header(AUTHORIZATION, kilo_auth_header(token))
 }
 
-pub type HttpsClient = hyper_util::client::legacy::Client<
-    hyper_rustls::HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>,
-    BoxBody<Bytes, Err>,
->;
-
-pub fn new_https_client() -> HttpsClient {
-    hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
-        .pool_idle_timeout(Duration::from_secs(120))
-        .pool_max_idle_per_host(16)
-        .build(build_https_connector())
-}
-
-pub async fn fetch_text_with(
-    client: &HttpsClient,
-    url: &str,
-    timeout: Duration,
-    limit: usize,
-) -> Result<String, String> {
-    let mut current = url.to_string();
-    for _ in 0..4 {
-        let req = Request::builder()
-            .method(Method::GET)
-            .uri(current.clone())
-            .header("User-Agent", UA_HEADER.clone())
-            .body(full_body(Bytes::new()))
-            .map_err(|e| e.to_string())?;
-        let res = tokio::time::timeout(timeout, client.request(req))
-            .await
-            .map_err(|_| format!("fetch {current} timed out"))?
-            .map_err(|e| format!("fetch {current}: {e}"))?;
-        let status = res.status();
-        if [301, 302, 303, 307, 308].contains(&status.as_u16()) {
-            let loc = res
-                .headers()
-                .get(hyper::header::LOCATION)
-                .and_then(|v| v.to_str().ok())
-                .ok_or_else(|| format!("fetch {current}: redirect without location"))?
-                .to_string();
-            current = if loc.starts_with("http://") || loc.starts_with("https://") {
-                loc
-            } else if let Some(path) = loc.strip_prefix('/') {
-                let base = current.split('/').take(3).collect::<Vec<_>>().join("/");
-                format!("{base}/{path}")
-            } else {
-                let base = current.rsplit_once('/').map(|(b, _)| b).unwrap_or(&current);
-                format!("{base}/{loc}")
-            };
-            continue;
-        }
-        if !status.is_success() {
-            return Err(format!("fetch {current}: HTTP {status}"));
-        }
-        let body = http_body_util::Limited::new(res.into_body(), limit)
-            .collect()
-            .await
-            .map_err(|e| e.to_string())?
-            .to_bytes();
-        return Ok(String::from_utf8_lossy(&body).into_owned());
-    }
-    Err(format!("fetch {url}: too many redirects"))
-}
-
-pub async fn fetch_text(url: &str, timeout: Duration, limit: usize) -> Result<String, String> {
-    fetch_text_with(&new_https_client(), url, timeout, limit).await
-}
-
-pub fn build_https_connector()
--> hyper_rustls::HttpsConnector<hyper_util::client::legacy::connect::HttpConnector> {
+pub fn build_https_connector(
+) -> hyper_rustls::HttpsConnector<hyper_util::client::legacy::connect::HttpConnector> {
     let mut http = hyper_util::client::legacy::connect::HttpConnector::new();
     http.set_connect_timeout(Some(Duration::from_secs(10)));
     http.set_nodelay(true);
@@ -528,233 +589,68 @@ pub async fn try_proxied_fallback(
     session: &str,
     body: &Bytes,
 ) -> Option<Response<Incoming>> {
-    const MAX_PROXIES_PER_REQUEST: usize = 3;
-    const RETRY_429_DELAY: Duration = Duration::from_millis(500);
-    let rotator = state.rotator.as_ref()?;
-    for _ in 0..MAX_PROXIES_PER_REQUEST {
-        let proxy_url = rotator.checkout()?;
-        let mut last_res: Option<Response<Incoming>> = None;
-        let mut proxy_dead = false;
-        for provider in providers.iter() {
-            let req = match chat_request(*provider, state, session, body.clone()) {
-                Ok(r) => r,
-                Err(_) => continue,
-            };
-            match proxied_with_ttfb(state, &proxy_url, req).await {
-                Ok(res) if res.status().is_success() => {
-                    rotator.checkin_ok(&proxy_url);
-                    state.stats.proxied_ok.fetch_add(1, Ordering::Relaxed);
-                    return Some(res);
-                }
-                Ok(res) => {
-                    let status = res.status();
-                    eprintln!("proxy via {} failed with {}", provider.as_str(), status);
-                    if status == StatusCode::TOO_MANY_REQUESTS {
-                        tokio::time::sleep(retry_after_delay(&res, RETRY_429_DELAY)).await;
-                        let retry_req = match chat_request(*provider, state, session, body.clone())
-                        {
-                            Ok(r) => r,
-                            Err(_) => {
-                                last_res = Some(res);
-                                break;
-                            }
-                        };
-                        match proxied_with_ttfb(state, &proxy_url, retry_req).await {
-                            Ok(r2) if r2.status().is_success() => {
-                                rotator.checkin_ok(&proxy_url);
-                                state.stats.proxied_ok.fetch_add(1, Ordering::Relaxed);
-                                state.stats.retry429_ok.fetch_add(1, Ordering::Relaxed);
-                                return Some(r2);
-                            }
-                            Ok(r2) => {
-                                eprintln!(
-                                    "proxy via {} still limited after retry: {}",
-                                    provider.as_str(),
-                                    r2.status()
-                                );
-                                last_res = Some(r2);
-                                break;
-                            }
-                            Err(e2) => {
-                                eprintln!(
-                                    "proxy {} retry failed: {e2}, dropping",
-                                    redact_proxy_url(&proxy_url)
-                                );
-                                rotator.discard(&proxy_url);
-                                state.stats.proxy_discards.fetch_add(1, Ordering::Relaxed);
-                                proxy_dead = true;
-                                break;
-                            }
-                        }
-                    }
-                    if is_retryable(status) {
-                        last_res = Some(res);
-                        continue;
-                    }
-                    rotator.checkin_ok(&proxy_url);
-                    state.stats.proxied_ok.fetch_add(1, Ordering::Relaxed);
-                    return Some(res);
-                }
-                Err(e) => {
-                    let msg = e.to_string();
-                    if msg.contains("timed out")
-                        || msg.contains("connect")
-                        || msg.contains("socks5")
-                        || msg.contains("proxy")
-                    {
-                        eprintln!("proxy {} dead: {e}, dropping", redact_proxy_url(&proxy_url));
-                    } else {
-                        eprintln!("proxy via {} failed: {e}", provider.as_str());
-                    }
-                    rotator.discard(&proxy_url);
-                    state.stats.proxy_discards.fetch_add(1, Ordering::Relaxed);
-                    proxy_dead = true;
-                    break;
-                }
-            }
-        }
-        if proxy_dead {
-            continue;
-        }
-        if let Some(res) = last_res {
-            if res.status() == StatusCode::TOO_MANY_REQUESTS {
-                rotator.checkin_ratelimited(&proxy_url);
-            } else {
-                rotator.checkin_ok(&proxy_url);
-            }
-            continue;
+    for p in providers {
+        let req = match chat_request(*p, state, session, body.clone()) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        match do_proxied_upstream_request(state, req).await {
+            Ok(r) if r.status().is_success() => return Some(r),
+            Ok(r) => eprintln!("proxy via {} failed with {}", p.as_str(), r.status()),
+            Err(e) => eprintln!("proxy via {} failed: {e}", p.as_str()),
         }
     }
     None
-}
-
-pub(crate) fn retry_after_delay(res: &Response<Incoming>, max: Duration) -> Duration {
-    let secs = res
-        .headers()
-        .get(hyper::header::RETRY_AFTER)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.trim().parse::<u64>().ok());
-    match secs {
-        Some(n) => max.min(Duration::from_secs(n)),
-        None => max,
-    }
-}
-
-type ProxyClient = hyper_util::client::legacy::Client<
-    hyper_proxy2::ProxyConnector<
-        hyper_rustls::HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>,
-    >,
-    BoxBody<Bytes, Err>,
->;
-
-fn proxy_client_for(proxy_url: &str) -> Result<ProxyClient, String> {
-    use std::sync::OnceLock;
-    static CACHE: OnceLock<parking_lot::Mutex<HashMap<String, ProxyClient>>> = OnceLock::new();
-    let mut cache = CACHE
-        .get_or_init(|| parking_lot::Mutex::new(HashMap::new()))
-        .lock();
-    if let Some(c) = cache.get(proxy_url) {
-        return Ok(c.clone());
-    }
-    if cache.len() > 256 {
-        cache.clear();
-    }
-    let proxy_uri: hyper::Uri = proxy_origin(proxy_url)
-        .parse()
-        .map_err(|e| format!("invalid proxy uri: {e}"))?;
-    let mut proxy = hyper_proxy2::Proxy::new(hyper_proxy2::Intercept::All, proxy_uri);
-    if let Some((user, pass)) = proxy_auth_parts(proxy_url) {
-        proxy.set_authorization(headers::Authorization::basic(user, pass));
-    }
-    let connector = hyper_proxy2::ProxyConnector::from_proxy(build_https_connector(), proxy)
-        .map_err(|e| format!("proxy connector: {e}"))?;
-    let client = hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
-        .pool_idle_timeout(Duration::from_secs(60))
-        .pool_max_idle_per_host(2)
-        .build(connector);
-    cache.insert(proxy_url.to_string(), client.clone());
-    Ok(client)
 }
 
 pub async fn do_upstream_request(
     state: &State,
     req: Request<BoxBody<Bytes, Err>>,
 ) -> Result<Response<Incoming>, Err> {
-    match tokio::time::timeout(state.timeouts.ttfb, state.client.request(req)).await {
-        Ok(r) => r.map_err(|e| Box::new(e) as Err),
-        Err(_) => Err(Box::from("upstream timed out") as Err),
-    }
+    state.client.request(req).await.map_err(|e| Box::new(e) as Err)
 }
 
-pub async fn request_via_proxy_url(
-    proxy_url: &str,
-    req: Request<BoxBody<Bytes, Err>>,
-) -> Result<Response<Incoming>, Err> {
-    if crate::proxy_dial::is_socks5(proxy_url) {
-        return crate::proxy_dial::request_via_socks5(proxy_url, req).await;
-    }
-    if proxy_url.starts_with("http://") || proxy_url.starts_with("https://") {
-        return build_proxy_request(proxy_url, req).await;
-    }
-    if proxy_url.starts_with("socks") {
-        return Err(format!("unsupported proxy protocol in v1: {proxy_url}").into());
-    }
-    Err(format!("unknown proxy protocol: {proxy_url}").into())
-}
-
-async fn proxied_with_ttfb(
+pub async fn do_proxied_upstream_request(
     state: &State,
+    req: Request<BoxBody<Bytes, Err>>,
+) -> Result<Response<Incoming>, Err> {
+    if let Some(rotator) = &state.rotator {
+        if let Some(proxy_url) = rotator.next_proxy() {
+            if proxy_url.starts_with("http://") || proxy_url.starts_with("https://") {
+                return build_proxy_request(&proxy_url, req).await;
+            } else if proxy_url.starts_with("socks") {
+                eprintln!("socks proxy {proxy_url} not yet supported, skipping");
+            }
+        }
+    }
+    Err("no proxy available".into())
+}
+
+async fn build_proxy_request(
     proxy_url: &str,
     req: Request<BoxBody<Bytes, Err>>,
 ) -> Result<Response<Incoming>, Err> {
-    match tokio::time::timeout(state.timeouts.ttfb, request_via_proxy_url(proxy_url, req)).await {
-        Ok(r) => r,
-        Err(_) => Err(Box::from("proxied upstream timed out") as Err),
+    use hyper_proxy2::{Intercept, Proxy, ProxyConnector};
+    use hyper_util::rt::TokioExecutor;
+    let proxy_uri: hyper::Uri = proxy_url.parse().map_err(|e| format!("invalid proxy uri: {e}"))?;
+    let mut proxy = Proxy::new(Intercept::All, proxy_uri);
+    if let Some(at) = proxy_url.find('@') {
+        if let Some(colon) = proxy_url[..at].rfind(':') {
+            if let Some(slash) = proxy_url[..at].rfind("//") {
+                let user = &proxy_url[slash + 2..colon];
+                let pass = &proxy_url[colon + 1..at];
+                if !user.is_empty() {
+                    proxy.set_authorization(headers::Authorization::basic(user, pass));
+                }
+            }
+        }
     }
-}
-
-pub(crate) fn redact_proxy_url(proxy_url: &str) -> String {
-    match proxy_url.rfind('@') {
-        Some(at) => match proxy_url[..at].rfind("//") {
-            Some(slash) => format!("{}//***@{}", &proxy_url[..slash], &proxy_url[at + 1..]),
-            None => format!("***@{}", &proxy_url[at + 1..]),
-        },
-        None => proxy_url.to_string(),
-    }
-}
-
-pub(crate) fn proxy_auth_parts(proxy_url: &str) -> Option<(&str, &str)> {
-    let at = proxy_url.rfind('@')?;
-    let scheme_end = proxy_url.find("://").map(|i| i + 3).unwrap_or(0);
-    let userinfo = proxy_url.get(scheme_end..at)?;
-    if userinfo.contains('/') {
-        return None;
-    }
-    let (user, pass) = userinfo.split_once(':')?;
-    if user.is_empty() {
-        return None;
-    }
-    Some((user, pass))
-}
-
-fn proxy_origin(proxy_url: &str) -> String {
-    match proxy_url.find("://") {
-        Some(i) => match proxy_url[i + 3..].rfind('@') {
-            Some(rel) => format!("{}://{}", &proxy_url[..i], &proxy_url[i + 3 + rel + 1..]),
-            None => proxy_url.to_string(),
-        },
-        None => match proxy_url.rfind('@') {
-            Some(at) => format!("http://{}", &proxy_url[at + 1..]),
-            None => format!("http://{proxy_url}"),
-        },
-    }
-}
-
-pub(crate) async fn build_proxy_request(
-    proxy_url: &str,
-    req: Request<BoxBody<Bytes, Err>>,
-) -> Result<Response<Incoming>, Err> {
-    let client = proxy_client_for(proxy_url).map_err(|e| Box::from(e) as Err)?;
+    let https = build_https_connector();
+    let proxy_connector = ProxyConnector::from_proxy(https, proxy).map_err(|e| format!("proxy connector: {e}"))?;
+    let client = hyper_util::client::legacy::Client::builder(TokioExecutor::new())
+        .pool_idle_timeout(Duration::from_secs(60))
+        .pool_max_idle_per_host(2)
+        .build(proxy_connector);
     client.request(req).await.map_err(|e| Box::new(e) as Err)
 }
 
@@ -821,7 +717,7 @@ pub async fn fetch_raw_with_fallback(
     let (providers, owner) = route_model(state, model);
     let mut last_res: Option<Response<Incoming>> = None;
     let mut last_err: Option<Err> = None;
-    let mut seen_retryable = false;
+    let mut seen_429 = false;
 
     for (idx, provider) in providers.iter().enumerate() {
         let req = chat_request(*provider, state, session, body.clone())?;
@@ -829,19 +725,16 @@ pub async fn fetch_raw_with_fallback(
             Ok(res) => {
                 let status = res.status();
                 if status.is_success() {
-                    state.stats.direct_ok.fetch_add(1, Ordering::Relaxed);
                     return Ok(res);
                 }
-                if is_retryable(status) {
-                    seen_retryable = true;
+                if status == StatusCode::TOO_MANY_REQUESTS {
+                    seen_429 = true;
                 }
-                if idx + 1 < providers.len() && owner != Some(*provider) && is_retryable(status) {
-                    eprintln!(
-                        "{} provider failed for model {} with {}, trying fallback",
-                        provider.as_str(),
-                        model,
-                        status
-                    );
+                if idx + 1 < providers.len()
+                    && owner != Some(*provider)
+                    && is_retryable(status)
+                {
+                    eprintln!("{} provider failed for model {} with {}, trying fallback", provider.as_str(), model, status);
                     last_res = Some(res);
                     continue;
                 }
@@ -859,12 +752,8 @@ pub async fn fetch_raw_with_fallback(
         }
     }
 
-    if state.rotator.is_some() && (seen_retryable || (last_res.is_none() && last_err.is_some())) {
+    if state.rotator.is_some() && (seen_429 || (last_res.is_none() && last_err.is_some())) {
         eprintln!("rate-limited or unreachable for {model}, trying via proxy");
-        state
-            .stats
-            .fallback_triggers
-            .fetch_add(1, Ordering::Relaxed);
         if let Some(r) = try_proxied_fallback(state, &providers, session, body).await {
             return Ok(r);
         }

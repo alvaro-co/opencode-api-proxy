@@ -1,9 +1,9 @@
-use crate::common::{full_body, kilo_auth_header, update_merged_models, Err, State, AUTH_HEADER, UA_HEADER};
+use crate::common::{full_body, kilo_auth_header, update_merged_models, Err, ModelMeta, State, AUTH_HEADER, MODELS_DEV_URL, UA_HEADER};
 use hyper::header::AUTHORIZATION;
-use http_body_util::BodyExt;
+use http_body_util::{BodyExt, Limited};
 use hyper::{Method, Request};
 use serde_json::Value;
-use std::{sync::{atomic::{AtomicBool, Ordering}, Arc}, time::{Duration, Instant}};
+use std::{collections::HashMap, sync::{atomic::{AtomicBool, Ordering}, Arc}, time::{Duration, Instant}};
 
 const REFRESH_INTERVAL: Duration = Duration::from_secs(3600);
 const RETRY_INTERVAL: Duration = Duration::from_secs(15);
@@ -40,11 +40,16 @@ pub async fn fetch_opencode_models(state: &Arc<State>) -> Result<Vec<String>, Er
     let body_bytes = res.into_body().collect().await?.to_bytes();
     let val: Value = serde_json::from_slice(&body_bytes)?;
     let mut list = Vec::new();
+    let meta = state.model_meta.read().clone();
 
     if let Some(arr) = val["data"].as_array() {
         for item in arr {
             if let Some(id) = item["id"].as_str() {
-                if id.ends_with("-free") || id == "big-pickle" || id == "big-picle" {
+                if id.ends_with("-free")
+                    || id == "big-pickle"
+                    || id == "big-picle"
+                    || meta.get(id).is_some_and(|m| m.free)
+                {
                     list.push(id.to_string());
                 }
             }
@@ -57,6 +62,53 @@ pub async fn fetch_opencode_models(state: &Arc<State>) -> Result<Vec<String>, Er
         return Ok(list);
     }
     Err("no free models in opencode upstream response".into())
+}
+
+pub async fn fetch_model_meta(state: &Arc<State>) -> Result<(usize, usize), Err> {
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri(MODELS_DEV_URL)
+        .header("User-Agent", UA_HEADER.clone())
+        .body(full_body(bytes::Bytes::new()))?;
+
+    let res = tokio::time::timeout(Duration::from_secs(60), state.client.request(req)).await??;
+    if !res.status().is_success() {
+        return Err(format!("models.dev returned status {}", res.status()).into());
+    }
+    let body_bytes = Limited::new(res.into_body(), 24 * 1024 * 1024)
+        .collect()
+        .await?
+        .to_bytes();
+    let val: Value = serde_json::from_slice(&body_bytes)?;
+
+    fn parse_provider(provider: &Value) -> HashMap<String, ModelMeta> {
+        let mut map = HashMap::new();
+        if let Some(obj) = provider["models"].as_object() {
+            for (id, m) in obj {
+                let input = m["cost"]["input"].as_f64().unwrap_or(1.0);
+                let output = m["cost"]["output"].as_f64().unwrap_or(1.0);
+                map.insert(
+                    id.clone(),
+                    ModelMeta {
+                        free: input == 0.0 && output == 0.0,
+                        context: m["limit"]["context"].as_u64().unwrap_or(0),
+                        output: m["limit"]["output"].as_u64().unwrap_or(0),
+                    },
+                );
+            }
+        }
+        map
+    }
+
+    let opencode = parse_provider(&val["opencode"]);
+    let kilo = parse_provider(&val["kilo"]);
+    if opencode.is_empty() {
+        return Err("models.dev has no opencode metadata".into());
+    }
+    let counts = (opencode.len(), kilo.len());
+    *state.model_meta.write() = Arc::new(opencode);
+    *state.kilo_meta.write() = Arc::new(kilo);
+    Ok(counts)
 }
 
 pub async fn fetch_kilo_models(state: &Arc<State>) -> Result<Vec<String>, Err> {
@@ -139,6 +191,37 @@ pub fn spawn_refresher(state: Arc<State>) {
                     fails += 1;
                     if fails == 1 || fails.is_multiple_of(20) {
                         eprintln!("opencode model refresh failed (attempt {fails}): {e}; retrying");
+                    }
+                    tokio::time::sleep(RETRY_INTERVAL).await;
+                }
+            }
+        }
+    });
+
+    let s_meta = Arc::clone(&state);
+    tokio::spawn(async move {
+        let mut announced = false;
+        let mut fails = 0u32;
+        loop {
+            match fetch_model_meta(&s_meta).await {
+                Ok(counts) => {
+                    fails = 0;
+                    if !announced {
+                        announced = true;
+                        println!(
+                            "  Models.dev: context metadata for {} opencode / {} kilo models",
+                            counts.0, counts.1
+                        );
+                    }
+                    // Reclassify models now that cost metadata is available.
+                    let _ = fetch_opencode_models(&s_meta).await;
+                    let _ = fetch_kilo_models(&s_meta).await;
+                    tokio::time::sleep(REFRESH_INTERVAL).await;
+                }
+                Err(e) => {
+                    fails += 1;
+                    if fails == 1 || fails.is_multiple_of(20) {
+                        eprintln!("models.dev metadata refresh failed (attempt {fails}): {e}; retrying");
                     }
                     tokio::time::sleep(RETRY_INTERVAL).await;
                 }

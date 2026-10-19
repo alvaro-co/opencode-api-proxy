@@ -126,7 +126,7 @@ Environment variables:
 
 Endpoints:
   GET  /health                 Liveness + version + auth mode
-  GET  /v1/models              List free models (merged OpenCode + Kilo)
+  GET  /v1/models              List free models with context limits (merged OpenCode + Kilo)
   POST /v1/chat/completions    OpenAI Chat Completions (stream + tools)
   POST /v1/responses           OpenAI Responses API (stream + tools)
   POST /v1/messages            Anthropic Messages (stream + tools)

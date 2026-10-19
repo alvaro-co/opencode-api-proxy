@@ -1,6 +1,6 @@
 use crate::common::{
-    anthropic_error, auth, get_session, json_res, oc_id, read_body, sse_frame,
-    sse_response, BoxRes, Err, State, SseDelta,
+    agg_to_oai, aggregate_sse, anthropic_error, auth, ensure_gate_tools, get_session, json_res,
+    oc_id, read_body, sse_frame, sse_response, BoxRes, Err, State, SseDelta,
 };
 use bytes::{Bytes, BytesMut};
 use http_body_util::{combinators::BoxBody, BodyExt, StreamBody};
@@ -94,7 +94,12 @@ pub async fn handle_messages(req: Request<hyper::body::Incoming>, state: Arc<Sta
     let stream = ant_body["stream"].as_bool().unwrap_or(false);
     let session = get_session(&state, &peer);
 
-    let mut req_payload = json!({"model": model, "messages": oai_msgs, "stream": stream});
+    let mut req_payload = json!({
+        "model": model,
+        "messages": oai_msgs,
+        "stream": true,
+        "stream_options": {"include_usage": true}
+    });
     if !oai_tools.is_empty() {
         req_payload["tools"] = json!(oai_tools);
     }
@@ -112,9 +117,7 @@ pub async fn handle_messages(req: Request<hyper::body::Incoming>, state: Arc<Sta
             req_payload["stop"] = json!(stops);
         }
     }
-    if stream {
-        req_payload["stream_options"] = json!({"include_usage": true});
-    }
+    let injected = ensure_gate_tools(&mut req_payload);
 
     let payload_bytes = serde_json::to_vec(&req_payload)?;
     let proxy_body = Bytes::from(payload_bytes);
@@ -127,12 +130,12 @@ pub async fn handle_messages(req: Request<hyper::body::Incoming>, state: Arc<Sta
     }
 
     if !stream {
-        let bytes = upstream_res.into_body().collect().await?.to_bytes();
-        let oai_res: Value = serde_json::from_slice(&bytes).unwrap_or_default();
+        let agg = aggregate_sse(upstream_res).await?;
+        let oai_res = agg_to_oai(&agg, &injected);
         return Ok(json_res(StatusCode::OK, anthropic_from_oai(model, &oai_res)));
     }
 
-    let rx = spawn_anthropic_stream(upstream_res, model.to_string());
+    let rx = spawn_anthropic_stream(upstream_res, model.to_string(), injected);
     Ok(sse_response(StatusCode::OK).body(BoxBody::new(StreamBody::new(ReceiverStream::new(rx).map(|res| res.map(Frame::data)))))?)
 }
 
@@ -187,6 +190,7 @@ fn anthropic_from_oai(model: &str, oai_res: &Value) -> Value {
 fn spawn_anthropic_stream(
     upstream_res: Response<hyper::body::Incoming>,
     model: String,
+    injected: Vec<String>,
 ) -> tokio::sync::mpsc::Receiver<Result<Bytes, Err>> {
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, Err>>(256);
 
@@ -207,6 +211,7 @@ fn spawn_anthropic_stream(
         let mut next_block_idx = 0usize;
         let mut text_block_idx: Option<usize> = None;
         let mut tool_block_indices: HashMap<i64, usize> = HashMap::new();
+        let mut dropped: std::collections::HashSet<i64> = std::collections::HashSet::new();
         let mut usage: Option<Value> = None;
 
         while let Some(frame_res) = body.frame().await {
@@ -271,13 +276,20 @@ fn spawn_anthropic_stream(
                         if let Some(tcs) = &choice.delta.tool_calls {
                             for tc in tcs {
                                 let tc_idx = tc.index.unwrap_or(0);
+                                if dropped.contains(&tc_idx) {
+                                    continue;
+                                }
                                 let idx = match tool_block_indices.get(&tc_idx) {
                                     Some(&i) => i,
                                     None => {
+                                        let name = tc.function.as_ref().and_then(|f| f.name.clone()).unwrap_or_default();
+                                        if injected.contains(&name) {
+                                            dropped.insert(tc_idx);
+                                            continue;
+                                        }
                                         let i = next_block_idx;
                                         next_block_idx += 1;
                                         tool_block_indices.insert(tc_idx, i);
-                                        let name = tc.function.as_ref().and_then(|f| f.name.clone()).unwrap_or_default();
                                         let tc_id = tc.id.clone().unwrap_or_else(|| oc_id("toolu"));
                                         send!(sse_frame(
                                             "content_block_start",
@@ -323,6 +335,15 @@ fn spawn_anthropic_stream(
             ));
             send!(sse_frame("content_block_start", &json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}})));
             next_block_idx = 1;
+        }
+
+        if next_block_idx == 0 {
+            send!(sse_frame("content_block_start", &json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}})));
+            next_block_idx = 1;
+        }
+
+        if stop_reason == "tool_use" && tool_block_indices.is_empty() {
+            stop_reason = "end_turn";
         }
 
         for i in 0..next_block_idx {

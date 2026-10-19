@@ -4,7 +4,7 @@ Ultra-fast, lightweight proxy written in Rust (`hyper` + `tokio`). It provides a
 
 Designed to seamlessly integrate coding assistants like Cursor, Roo Code, Cline, Aider, OpenCode, and any OpenAI/Anthropic API-compatible client with free LLMs without configuration friction or managing custom headers.
 
-The static binary is ~3MB, consumes ~2-3MB of RAM with virtually zero CPU overhead. It uses `webpki-roots` (no OpenSSL runtime dependency) and features zero-copy streaming pass-through for OpenAI requests and real-time line-by-line event translation for Anthropic/Responses SSE clients.
+The static binary is ~3MB, consumes ~2-3MB of RAM with virtually zero CPU overhead. It uses `webpki-roots` (no OpenSSL runtime dependency), transparently satisfies the OpenCode v2 client gate, and provides real-time line-by-line SSE translation for all three APIs.
 
 ---
 
@@ -113,15 +113,16 @@ Environment variables (lower precedence than flags): `PORT` (or `PROXY_PORT`), `
 Every start prints a short status block:
 
 ```
-opencode-api-proxy v1.2.1
+opencode-api-proxy v2.0.0
   URL    http://0.0.0.0:6446
   Auth   none required
   Kilo   enabled (token: anonymous)
   Proxy  2 proxies (interval 900s)
   Config ./config.json (read-only, use --enforce-config to rewrite)
-  Opencode: 8 free models (auto-refresh hourly)
-  Kilo: 24 free models (auto-refresh hourly)
-  Models 32 available (merged, auto-refresh hourly)
+  Models.dev: context metadata for 128 opencode / 396 kilo models
+  Opencode: 10 free models (auto-refresh hourly)
+  Kilo: 18 free models (auto-refresh hourly)
+  Models 28 available (merged, auto-refresh hourly)
 ```
 
 <details>
@@ -154,8 +155,10 @@ journalctl -u opencode-api-proxy -f
 
 The proxy merges free models from both upstreams and routes requests intelligently:
 
-- **OpenCode** (`https://opencode.ai/zen/v1`) — 8 free models like `big-pickle`, `deepseek-v4-flash-free`, `mimo-v2.5-free` (IDs ending in `-free`, no slash). Auth: `Bearer public`.
-- **Kilo** (`https://api.kilo.ai/api/openrouter`) — 24 free models like `stepfun/step-3.7-flash:free`, `kilo-auto/free`, `openrouter/free` (IDs containing `:free`, `isFree=true`, or `(free)` in the name). Auth: `Bearer anonymous` by default, or your own via `--kilo-token` / `KILO_TOKEN`.
+- **OpenCode** (`https://opencode.ai/zen/v1`) — 10 free models such as `deepseek-v4.1-flash-free`, `big-pickle`, `minimax-m3.1-flash-free`, `glm-5.3-flash-free`, and `nemotron-3.5-lightning-free` (IDs ending in `-free` plus `big-pickle`). Auth: `Bearer public`.
+- **Kilo** (`https://api.kilo.ai/api/openrouter`) — 18 free models such as `kilo-auto/free`, `openrouter/free`, `nvidia/nemotron-3-super-120b-a12b:free` (IDs containing `:free`, `isFree=true`, or `(free)` in the name). Auth: `Bearer anonymous` by default, or your own via `--kilo-token` / `KILO_TOKEN`.
+
+**OpenCode v2 gate:** OpenCode's free tier only answers clients that identify as OpenCode. The proxy automatically adds the canonical client User-Agent, session and request IDs, `stream: true`, and the tool declarations OpenCode expects (`bash`, `glob`, `grep`, `read`, `edit`, `write`). Placeholder tools are filtered out of every response, so clients only ever see their own tools. Non-streaming clients are served by reassembling the upstream stream internally.
 
 **Routing:** The proxy picks the provider that actually owns the requested model ID (exact match). For unknown IDs it uses a heuristic (`:` / `/` → Kilo, else Opencode). **Fallback:** If the primary provider fails with a retryable error (429/400/404/5xx) *and the other provider could plausibly serve the model*, it retries there. If a model is known to live on only one provider, that provider's result is returned as-is (nowhere else to get it from). If rate-limited everywhere and proxies are configured, it retries via the next proxy. This makes the two free tiers act as backups for each other — no manual switching needed.
 
@@ -217,8 +220,8 @@ curl http://127.0.0.1:6446/health | jq .proxy_rotator
 | Endpoint | Description |
 | :--- | :--- |
 | `GET /health` | Liveness, version, auth mode, model counts per provider + proxy status |
-| `GET /v1/models` | List merged free models (OpenCode + Kilo) |
-| `POST /v1/chat/completions` | OpenAI Chat Completions (streaming + tools, raw passthrough incl. `reasoning`) |
+| `GET /v1/models` | List merged free models (OpenCode + Kilo) with `context_length` / `max_output_tokens` when known |
+| `POST /v1/chat/completions` | OpenAI Chat Completions (streaming + tools, JSON or SSE output, `reasoning_content` preserved) |
 | `POST /v1/responses` | OpenAI Responses API (streaming + tools, `input` string/items, `instructions`, function calls; `reasoning` mapped to text) |
 | `POST /v1/messages` | Anthropic Messages (streaming + tools, content blocks, `tool_use` / `tool_result`; `reasoning` mapped to text) |
 
@@ -228,12 +231,12 @@ Example:
 # OpenCode model
 curl http://127.0.0.1:6446/v1/chat/completions \
   -H 'content-type: application/json' \
-  -d '{"model":"mimo-v2.5-free","messages":[{"role":"user","content":"hi"}],"stream":true}'
+  -d '{"model":"deepseek-v4.1-flash-free","messages":[{"role":"user","content":"hi"}],"stream":true}'
 
-# Kilo model (colon style)
+# Kilo model
 curl http://127.0.0.1:6446/v1/chat/completions \
   -H 'content-type: application/json' \
-  -d '{"model":"stepfun/step-3.7-flash:free","messages":[{"role":"user","content":"hi"}]}'
+  -d '{"model":"nvidia/nemotron-3-super-120b-a12b:free","messages":[{"role":"user","content":"hi"}]}'
 
 # Auto router (Kilo)
 curl http://127.0.0.1:6446/v1/chat/completions \
@@ -254,20 +257,22 @@ curl http://127.0.0.1:6446/v1/messages \
 
 ## Features
 
-- **Two providers, one API:** Merged OpenCode (8) + Kilo (24) free models with automatic fallback on 429/400. `"models are mostly the same, so it should use both as a backup"` — they do.
+- **Two providers, one API:** Merged OpenCode (10) + Kilo (18) free models with automatic fallback on 429/400. `"models are mostly the same, so it should use both as a backup"` — they do.
+- **OpenCode v2 compatible:** canonical session/request IDs, the OpenCode client User-Agent, `stream: true`, and the required tool declarations are supplied automatically. Gate-only tool calls are filtered from streaming and non-streaming responses.
 - **Three APIs, one binary:** OpenAI `/v1/chat/completions` + `/v1/responses` and Anthropic `/v1/messages`.
-- **Dynamic model listing:** free models are fetched from both upstreams at startup and refreshed hourly for `/v1/models`. Completion requests are forwarded as-is — the upstream stays the single source of truth, so newly added models work immediately.
-- **Zero-copy streaming:** fast passthrough for OpenAI format with zero memory re-encoding.
-- **Real-time SSE translation:** Anthropic and Responses streams are rebuilt from upstream chat chunks on the fly, including tool-call argument deltas and `reasoning` → text mapping for reasoning models.
+- **Dynamic model listing:** free models are fetched from both upstreams at startup and refreshed hourly for `/v1/models`, including `context_length` / `max_output_tokens` from models.dev. Newly added models work without a restart.
+- **Streaming everywhere:** real-time SSE translation for all three APIs, including tool-call argument deltas, reasoning deltas, and usage. Non-streaming requests are answered from the same upstream stream.
+- **Proxy rotator:** optional manual proxies via `--proxy`, `--proxy-file`, or `--proxy-url`; no scraping, no background proxy discovery.
 - **Production ready:** 10MB body limit (60s read timeout), per-peer session rotation, connection pooling with keep-alive tuning, constant-time API key comparison, graceful shutdown on Ctrl+C/SIGTERM, 429-aware provider + proxy fallback.
 
 ## Notes & limitations
 
 - The proxy is **stateless**: `previous_response_id` on `/v1/responses` is ignored — send full conversation history each call.
-- `n > 1` multi-choice sampling only works natively via `/v1/chat/completions` (passthrough); the translated endpoints return a single choice.
+- Responses always contain a single choice; `n > 1` is not supported.
 - Sampling params (`temperature`, `top_p`, `stop_sequences`/`stop`, `max_tokens`, `seed`, `tool_choice`) are forwarded; provider-specific extras like Anthropic `top_k` or image inputs are not supported by the free upstream models.
+- The free models have varying context limits (200K to ~1M tokens). The proxy forwards `max_tokens` unchanged and reports each model's limits in `/v1/models`; the upstream enforces them.
 - No CORS/OPTIONS handling — intended for native apps and server-side clients, not browsers.
-- Kilo reasoning models stream `reasoning` deltas; the proxy maps them to `text`/`output_text` so clients see the output. Raw `reasoning` is preserved on direct `/v1/chat/completions` passthrough.
+- Reasoning models are exposed as `reasoning_content` on chat completions; the translated endpoints include reasoning text. Raw `reasoning` is also preserved on `/v1/chat/completions` when the upstream sends that field.
 
 ## License
 

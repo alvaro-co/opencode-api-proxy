@@ -51,6 +51,8 @@ async fn router(req: Request<Incoming>, state: Arc<State>, peer: String) -> Resu
             match models::wait_for_models(&state).await {
                 Some(models) => {
                     let kilo_set = state.kilo_models.read();
+                    let opencode_meta = state.model_meta.read().clone();
+                    let kilo_meta = state.kilo_meta.read().clone();
                     let created = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap_or_default()
@@ -58,12 +60,19 @@ async fn router(req: Request<Incoming>, state: Arc<State>, peer: String) -> Resu
                     let data: Vec<_> = models
                         .iter()
                         .map(|id| {
-                            let owned_by = if kilo_set.iter().any(|m| m == id) {
-                                "kilo-free"
-                            } else {
-                                "opencode-free"
-                            };
-                            json!({"id": id, "object": "model", "created": created, "owned_by": owned_by})
+                            let is_kilo = kilo_set.iter().any(|m| m == id);
+                            let owned_by = if is_kilo { "kilo-free" } else { "opencode-free" };
+                            let meta_map = if is_kilo { &kilo_meta } else { &opencode_meta };
+                            let mut entry = json!({"id": id, "object": "model", "created": created, "owned_by": owned_by});
+                            if let Some(meta) = meta_map.get(id) {
+                                if meta.context > 0 {
+                                    entry["context_length"] = json!(meta.context);
+                                }
+                                if meta.output > 0 {
+                                    entry["max_output_tokens"] = json!(meta.output);
+                                }
+                            }
+                            entry
                         })
                         .collect();
                     let res = json_res(StatusCode::OK, json!({"object": "list", "data": data}));
@@ -218,6 +227,8 @@ async fn main() -> Result<(), Err> {
         models: RwLock::new(Arc::new(Vec::new())),
         opencode_models: RwLock::new(Arc::new(Vec::new())),
         kilo_models: RwLock::new(Arc::new(Vec::new())),
+        model_meta: RwLock::new(Arc::new(HashMap::new())),
+        kilo_meta: RwLock::new(Arc::new(HashMap::new())),
         notify: Notify::new(),
         opencode_base,
         kilo_base,

@@ -9,7 +9,10 @@ use std::{
     collections::HashMap,
     fmt::Write as FmtWrite,
     io::Write as IoWrite,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -19,13 +22,27 @@ pub type BoxRes = Response<BoxBody<Bytes, Err>>;
 pub const MAX_BODY_SIZE: usize = 10 * 1024 * 1024;
 pub const SESSION_TTL: u64 = 1800;
 
-pub static UA_HEADER: HeaderValue =
-    HeaderValue::from_static("opencode/1.15.0 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.13");
+// OpenCode v2 identifies its own client by this three-part User-Agent shape; the
+// free-tier gate rejects anything else (and Cloudflare rejects requests without it).
+pub static UA_HEADER: HeaderValue = HeaderValue::from_static("opencode/stable/2.0.32/cli");
 pub static AUTH_HEADER: HeaderValue = HeaderValue::from_static("Bearer public");
 pub static JSON_HEADER: HeaderValue = HeaderValue::from_static("application/json");
 
 pub const UPSTREAM_BASE_DEFAULT: &str = "https://opencode.ai/zen/v1";
 pub const KILO_BASE_DEFAULT: &str = "https://api.kilo.ai/api/openrouter";
+pub const MODELS_DEV_URL: &str = "https://models.dev/api.json";
+
+/// Tool names the OpenCode v2 free-tier gate expects in every request. When a
+/// caller does not declare them the proxy adds inert placeholders that are
+/// filtered out of the response again.
+pub const GATE_TOOLS: [&str; 6] = ["bash", "glob", "grep", "read", "edit", "write"];
+
+#[derive(Clone, Copy, Default)]
+pub struct ModelMeta {
+    pub free: bool,
+    pub context: u64,
+    pub output: u64,
+}
 
 pub struct State {
     pub client: hyper_util::client::legacy::Client<
@@ -38,6 +55,8 @@ pub struct State {
     pub models: RwLock<Arc<Vec<String>>>,
     pub opencode_models: RwLock<Arc<Vec<String>>>,
     pub kilo_models: RwLock<Arc<Vec<String>>>,
+    pub model_meta: RwLock<Arc<HashMap<String, ModelMeta>>>,
+    pub kilo_meta: RwLock<Arc<HashMap<String, ModelMeta>>>,
     pub notify: tokio::sync::Notify,
     pub opencode_base: String,
     pub kilo_base: String,
@@ -175,15 +194,29 @@ pub fn rand_hex(n: usize) -> String {
         .collect()
 }
 
+static OC_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Canonical OpenCode ID generator. IDs look like `ses_0a1b2c3d4e5fAbCdEfGhIjKlMn`
+/// with a 48-bit packed timestamp+counter (inverted for sessions) followed by 14
+/// random base62 characters. The free-tier gate validates this shape, so IDs we
+/// send upstream must not be arbitrary strings.
 pub fn oc_id(prefix: &str) -> String {
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
-        .as_millis();
-    let mut s = String::with_capacity(prefix.len() + 30);
-    let _ = write!(s, "{}_{:x}", prefix, ts);
-    s.push_str(&rand_alnum(12));
+        .as_millis() as u64;
+    let seq = OC_SEQ.fetch_add(1, Ordering::Relaxed) & 0xFFF;
+    let n = ts.wrapping_mul(4096).wrapping_add(seq);
+    let raw = n & 0xFFFF_FFFF_FFFF;
+    let val = if prefix == "ses" { !raw & 0xFFFF_FFFF_FFFF } else { raw };
+    let mut s = String::with_capacity(prefix.len() + 28);
+    let _ = write!(s, "{prefix}_{val:012x}");
+    s.push_str(&rand_alnum(14));
     s
+}
+
+pub fn unix_now() -> u64 {
+    now_secs()
 }
 
 pub fn gen_api_key() -> String {
@@ -273,6 +306,181 @@ pub struct SseFunction {
     pub arguments: Option<String>,
 }
 
+pub fn ensure_gate_tools(payload: &mut Value) -> Vec<String> {
+    let mut tools = payload["tools"].as_array().cloned().unwrap_or_default();
+    let mut names: std::collections::HashSet<String> = tools
+        .iter()
+        .filter_map(|t| t["function"]["name"].as_str().map(str::to_string))
+        .collect();
+    let mut injected = Vec::new();
+    for name in GATE_TOOLS {
+        if names.insert(name.to_string()) {
+            tools.push(json!({
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": "Do not call this tool. It exists only for API compatibility and must never be invoked.",
+                    "parameters": {"type": "object", "properties": {}}
+                }
+            }));
+            injected.push(name.to_string());
+        }
+    }
+    if !tools.is_empty() {
+        payload["tools"] = json!(tools);
+    }
+    injected
+}
+
+#[derive(Default, Clone)]
+pub struct ToolAgg {
+    pub id: String,
+    pub name: String,
+    pub arguments: String,
+}
+
+#[derive(Default)]
+pub struct ChatAgg {
+    pub id: Option<String>,
+    pub created: Option<u64>,
+    pub model: Option<String>,
+    pub content: String,
+    pub reasoning: String,
+    pub reasoning_field: Option<String>,
+    pub calls: Vec<(i64, ToolAgg)>,
+    pub usage: Option<Value>,
+    pub finish_reason: Option<String>,
+}
+
+/// Consume an upstream OpenAI-compatible SSE stream and reassemble it into a
+/// single completion. The upstream stream is always requested even when the
+/// caller wants a non-streaming answer, because the gate requires `stream:true`.
+pub async fn aggregate_sse(res: Response<Incoming>) -> Result<ChatAgg, Err> {
+    let mut agg = ChatAgg::default();
+    let mut body = res.into_body();
+    let mut buffer = BytesMut::with_capacity(1024);
+    while let Some(frame) = body.frame().await {
+        let frame = frame?;
+        let Ok(chunk) = frame.into_data() else { continue };
+        buffer.extend_from_slice(&chunk);
+        while let Some(pos) = memchr::memchr(b'\n', &buffer) {
+            let line = buffer.split_to(pos + 1);
+            let trimmed = line.trim_ascii();
+            if !trimmed.starts_with(b"data: ") || trimmed.ends_with(b"[DONE]") {
+                continue;
+            }
+            let Ok(v) = serde_json::from_slice::<Value>(&trimmed[6..]) else { continue };
+            if let Some(id) = v["id"].as_str() {
+                if agg.id.is_none() {
+                    agg.id = Some(id.to_string());
+                }
+            }
+            if let Some(created) = v["created"].as_u64() {
+                agg.created = Some(created);
+            }
+            if let Some(model) = v["model"].as_str() {
+                agg.model = Some(model.to_string());
+            }
+            if v["usage"].is_object() {
+                agg.usage = Some(v["usage"].clone());
+            }
+            let Some(choice) = v["choices"].get(0) else { continue };
+            let delta = &choice["delta"];
+            if let Some(c) = delta["content"].as_str() {
+                agg.content.push_str(c);
+            }
+            if let Some(r) = delta["reasoning"].as_str() {
+                agg.reasoning_field = Some("reasoning".to_string());
+                agg.reasoning.push_str(r);
+            } else if let Some(r) = delta["reasoning_content"].as_str() {
+                agg.reasoning_field = Some("reasoning_content".to_string());
+                agg.reasoning.push_str(r);
+            }
+            if let Some(tcs) = delta["tool_calls"].as_array() {
+                for tc in tcs {
+                    let idx = tc["index"].as_i64().unwrap_or(0);
+                    if !agg.calls.iter().any(|(i, _)| *i == idx) {
+                        agg.calls.push((idx, ToolAgg::default()));
+                    }
+                    let entry = &mut agg.calls.iter_mut().find(|(i, _)| *i == idx).unwrap().1;
+                    if let Some(id) = tc["id"].as_str() {
+                        if entry.id.is_empty() {
+                            entry.id = id.to_string();
+                        }
+                    }
+                    if let Some(name) = tc["function"]["name"].as_str() {
+                        entry.name = name.to_string();
+                    }
+                    if let Some(args) = tc["function"]["arguments"].as_str() {
+                        entry.arguments.push_str(args);
+                    }
+                }
+            }
+            if let Some(fr) = choice["finish_reason"].as_str() {
+                agg.finish_reason = Some(fr.to_string());
+            }
+        }
+    }
+    agg.calls.sort_by_key(|(i, _)| *i);
+    Ok(agg)
+}
+
+/// Build a non-streaming OpenAI chat.completion from an aggregated upstream
+/// stream, dropping any tool calls that were only injected for the gate.
+pub fn agg_to_oai(agg: &ChatAgg, skip: &[String]) -> Value {
+    let calls: Vec<Value> = agg
+        .calls
+        .iter()
+        .filter(|(_, c)| !c.name.is_empty() && !skip.contains(&c.name))
+        .map(|(_, c)| {
+            json!({
+                "id": if c.id.is_empty() { format!("call_{}", rand_hex(16)) } else { c.id.clone() },
+                "type": "function",
+                "function": {
+                    "name": c.name,
+                    "arguments": if c.arguments.is_empty() { "{}".to_string() } else { c.arguments.clone() }
+                }
+            })
+        })
+        .collect();
+    let mut message = json!({"role": "assistant"});
+    message["content"] = if agg.content.is_empty() && !calls.is_empty() {
+        Value::Null
+    } else {
+        json!(agg.content)
+    };
+    if !agg.reasoning.is_empty() {
+        message["reasoning_content"] = json!(agg.reasoning);
+        if agg.reasoning_field.as_deref() == Some("reasoning") {
+            message["reasoning"] = json!(agg.reasoning);
+        }
+    }
+    if !calls.is_empty() {
+        message["tool_calls"] = json!(calls);
+    }
+    let finish_reason = match agg.finish_reason.as_deref() {
+        Some("tool_calls") if calls.is_empty() => "stop",
+        Some(fr) => fr,
+        None => "stop",
+    };
+    json!({
+        "id": agg.id.clone().unwrap_or_else(|| format!("chatcmpl-{}", rand_hex(16))),
+        "object": "chat.completion",
+        "created": agg.created.unwrap_or_else(unix_now),
+        "model": agg.model.clone().unwrap_or_default(),
+        "choices": [{
+            "index": 0,
+            "message": message,
+            "finish_reason": finish_reason
+        }],
+        "usage": agg.usage.clone().unwrap_or_else(|| json!({
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0
+        }))
+    })
+}
+
 pub fn upstream_builder(method: Method, uri: String, session: &str) -> hyper::http::request::Builder {
     Request::builder()
         .method(method)
@@ -280,10 +488,14 @@ pub fn upstream_builder(method: Method, uri: String, session: &str) -> hyper::ht
         .header(CONTENT_TYPE, JSON_HEADER.clone())
         .header(AUTHORIZATION, AUTH_HEADER.clone())
         .header("User-Agent", UA_HEADER.clone())
+        .header("Accept", "text/event-stream")
         .header("x-opencode-client", "cli")
         .header("x-opencode-project", "global")
         .header("x-opencode-request", oc_id("msg"))
         .header("x-opencode-session", session)
+        .header("x-opencode-session-id", session)
+        .header("x-session-affinity", session)
+        .header("X-Session-Id", session)
 }
 
 pub fn kilo_auth_header(token: &str) -> HeaderValue {

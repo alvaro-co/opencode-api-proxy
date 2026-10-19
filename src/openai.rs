@@ -1,11 +1,11 @@
 use crate::common::{
-    auth, error_res, get_session, json_res, rand_hex, read_body, sse_frame,
-    sse_response, BoxRes, Err, State, SseDelta,
+    agg_to_oai, aggregate_sse, auth, ensure_gate_tools, error_res, get_session, json_res,
+    rand_hex, read_body, sse_frame, sse_response, BoxRes, Err, State, SseDelta,
 };
-use bytes::{Bytes, BytesMut};
+use bytes::{BufMut, Bytes, BytesMut};
 use http_body_util::{combinators::BoxBody, BodyExt, StreamBody};
 use hyper::body::Frame;
-use hyper::header::{CACHE_CONTROL, CONTENT_TYPE};
+use hyper::header::CONTENT_TYPE;
 use hyper::{Request, Response, StatusCode};
 use serde_json::{json, Value};
 use std::{
@@ -24,30 +24,152 @@ pub async fn handle_chat_completions(req: Request<hyper::body::Incoming>, state:
         crate::common::BodyRead::Data(b) => b,
         crate::common::BodyRead::Fail(status, msg) => return Ok(error_res(status, msg)),
     };
-    let body_json: Value = match serde_json::from_slice(&body_bytes) {
+    let mut body_json: Value = match serde_json::from_slice(&body_bytes) {
         Ok(v) => v,
         Err(_) => return Ok(error_res(StatusCode::BAD_REQUEST, "Invalid JSON")),
     };
 
-    let model = body_json["model"].as_str().unwrap_or("");
-    let stream = body_json["stream"].as_bool().unwrap_or(false);
+    let model = body_json["model"].as_str().unwrap_or("").to_string();
+    let client_stream = body_json["stream"].as_bool().unwrap_or(false);
     let session = get_session(&state, &peer);
 
-    let upstream_res =
-        crate::common::fetch_raw_with_fallback(&state, model, &session, &body_bytes).await?;
-    let (parts, body) = upstream_res.into_parts();
-    let mut builder = Response::builder().status(parts.status);
+    // The upstream free-tier gate expects the OpenCode tool set and a streaming
+    // request. Requests are therefore always streamed upstream, even when the
+    // caller asked for a plain JSON answer (which is then reassembled below).
+    let injected = ensure_gate_tools(&mut body_json);
+    body_json["stream"] = json!(true);
+    body_json["stream_options"] = json!({"include_usage": true});
+    let payload_bytes = Bytes::from(serde_json::to_vec(&body_json)?);
 
-    if stream && parts.status.is_success() {
-        builder = builder
-            .header(CONTENT_TYPE, "text/event-stream")
-            .header(CACHE_CONTROL, "no-cache, no-transform")
-            .header("X-Accel-Buffering", "no");
-    } else if let Some(ct) = parts.headers.get(CONTENT_TYPE) {
-        builder = builder.header(CONTENT_TYPE, ct);
+    let upstream_res =
+        crate::common::fetch_raw_with_fallback(&state, &model, &session, &payload_bytes).await?;
+    let status = upstream_res.status();
+    if !status.is_success() {
+        let (parts, body) = upstream_res.into_parts();
+        let mut builder = Response::builder().status(parts.status);
+        if let Some(ct) = parts.headers.get(CONTENT_TYPE) {
+            builder = builder.header(CONTENT_TYPE, ct);
+        }
+        return Ok(builder.body(BoxBody::new(body.map_err(|e| Box::new(e) as Err)))?);
     }
 
-    Ok(builder.body(BoxBody::new(body.map_err(|e| Box::new(e) as Err)))?)
+    if client_stream {
+        let rx = spawn_chat_stream(upstream_res, injected);
+        return Ok(sse_response(StatusCode::OK)
+            .body(BoxBody::new(StreamBody::new(ReceiverStream::new(rx).map(|res| res.map(Frame::data)))))?);
+    }
+
+    let agg = aggregate_sse(upstream_res).await?;
+    Ok(json_res(StatusCode::OK, agg_to_oai(&agg, &injected)))
+}
+
+#[derive(Default)]
+struct ChatToolState {
+    name: Option<String>,
+    dropped: bool,
+    pending: Vec<Value>,
+}
+
+/// Rewrite one upstream chat.completion chunk, removing tool calls that only
+/// exist because the proxy injected gate tools.
+fn filter_chat_chunk(
+    mut v: Value,
+    injected: &[String],
+    states: &mut HashMap<i64, ChatToolState>,
+    saw_real: &mut bool,
+) -> Option<Value> {
+    let Some(choice) = v["choices"].get_mut(0) else {
+        return Some(v);
+    };
+
+    if let Some(tcs) = choice["delta"]["tool_calls"].as_array().cloned() {
+        let mut kept: Vec<Value> = Vec::new();
+        for tc in tcs {
+            let idx = tc["index"].as_i64().unwrap_or(0);
+            let entry = states.entry(idx).or_default();
+            if entry.name.is_none() {
+                if let Some(name) = tc["function"]["name"].as_str() {
+                    entry.name = Some(name.to_string());
+                    entry.dropped = injected.iter().any(|s| s == name);
+                }
+            }
+            if entry.dropped {
+                continue;
+            }
+            if entry.name.is_none() {
+                // The tool name has not been seen yet; hold fragments back until
+                // it is known whether this call must be filtered.
+                entry.pending.push(tc);
+                continue;
+            }
+            if !entry.pending.is_empty() {
+                kept.append(&mut entry.pending);
+            }
+            kept.push(tc);
+            *saw_real = true;
+        }
+        if let Some(delta) = choice["delta"].as_object_mut() {
+            if kept.is_empty() {
+                delta.remove("tool_calls");
+            } else {
+                delta.insert("tool_calls".to_string(), json!(kept));
+            }
+        }
+    }
+
+    if choice["finish_reason"].as_str() == Some("tool_calls") && !*saw_real {
+        choice["finish_reason"] = json!("stop");
+    }
+
+    let delta_empty = choice["delta"].as_object().is_none_or(|o| o.is_empty());
+    if delta_empty && choice["finish_reason"].is_null() && v["usage"].is_null() {
+        return None;
+    }
+    Some(v)
+}
+
+fn spawn_chat_stream(
+    upstream_res: Response<hyper::body::Incoming>,
+    injected: Vec<String>,
+) -> tokio::sync::mpsc::Receiver<Result<Bytes, Err>> {
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, Err>>(256);
+
+    tokio::spawn(async move {
+        let mut body = upstream_res.into_body();
+        let mut buffer = BytesMut::with_capacity(1024);
+        let mut states: HashMap<i64, ChatToolState> = HashMap::new();
+        let mut saw_real = false;
+
+        while let Some(frame_res) = body.frame().await {
+            let Ok(frame) = frame_res else { continue };
+            let Ok(chunk) = frame.into_data() else { continue };
+            buffer.extend_from_slice(&chunk);
+
+            while let Some(pos) = memchr::memchr(b'\n', &buffer) {
+                let line = buffer.split_to(pos + 1);
+                let trimmed = line.trim_ascii();
+                if trimmed.starts_with(b"data: ") && !trimmed.ends_with(b"[DONE]") {
+                    let Ok(v) = serde_json::from_slice::<Value>(&trimmed[6..]) else {
+                        continue;
+                    };
+                    let Some(out) = filter_chat_chunk(v, &injected, &mut states, &mut saw_real) else {
+                        continue;
+                    };
+                    let mut buf = BytesMut::with_capacity(256);
+                    buf.extend_from_slice(b"data: ");
+                    let _ = serde_json::to_writer((&mut buf).writer(), &out);
+                    buf.extend_from_slice(b"\n\n");
+                    if tx.send(Ok(buf.freeze())).await.is_err() {
+                        return;
+                    }
+                } else if tx.send(Ok(Bytes::copy_from_slice(&line))).await.is_err() {
+                    return;
+                }
+            }
+        }
+    });
+
+    rx
 }
 
 pub async fn handle_responses(req: Request<hyper::body::Incoming>, state: Arc<State>, peer: String) -> Result<BoxRes, Err> {
@@ -76,7 +198,12 @@ pub async fn handle_responses(req: Request<hyper::body::Incoming>, state: Arc<St
     }
     convert_input(&body["input"], &mut messages);
 
-    let mut payload = json!({"model": model, "messages": messages, "stream": stream});
+    let mut payload = json!({
+        "model": model,
+        "messages": messages,
+        "stream": true,
+        "stream_options": {"include_usage": true}
+    });
     if let Some(tools) = convert_tools(body["tools"].as_array()) {
         payload["tools"] = tools;
     }
@@ -98,9 +225,7 @@ pub async fn handle_responses(req: Request<hyper::body::Incoming>, state: Arc<St
     if let Some(n) = body["max_output_tokens"].as_u64() {
         payload["max_tokens"] = json!(n);
     }
-    if stream {
-        payload["stream_options"] = json!({"include_usage": true});
-    }
+    let injected = ensure_gate_tools(&mut payload);
 
     let payload_bytes = serde_json::to_vec(&payload)?;
     let proxy_body = Bytes::from(payload_bytes);
@@ -113,28 +238,26 @@ pub async fn handle_responses(req: Request<hyper::body::Incoming>, state: Arc<St
     }
 
     if !stream {
-        let full_body_bytes = upstream_res.into_body().collect().await?.to_bytes();
-        let oai: Value = serde_json::from_slice(&full_body_bytes).unwrap_or(json!({}));
-        let choice = &oai["choices"][0];
-        let text = crate::common::message_text(&choice["message"]);
+        let agg = aggregate_sse(upstream_res).await?;
+        let text = agg.content.clone();
         let mut calls: Vec<(String, String, String)> = Vec::new();
-        if let Some(tcs) = choice["message"]["tool_calls"].as_array() {
-            for tc in tcs {
-                let cid = tc["id"].as_str().unwrap_or("");
-                calls.push((
-                    if cid.is_empty() { format!("call_{}", rand_hex(16)) } else { cid.to_string() },
-                    tc["function"]["name"].as_str().unwrap_or("").to_string(),
-                    tc["function"]["arguments"].as_str().unwrap_or("{}").to_string(),
-                ));
+        for (_, c) in &agg.calls {
+            if c.name.is_empty() || injected.contains(&c.name) {
+                continue;
             }
+            calls.push((
+                if c.id.is_empty() { format!("call_{}", rand_hex(16)) } else { c.id.clone() },
+                c.name.clone(),
+                if c.arguments.is_empty() { "{}".to_string() } else { c.arguments.clone() },
+            ));
         }
         let resp_id = format!("resp_{}", rand_hex(16));
         let msg_id = format!("msg_{}", rand_hex(12));
-        let resp = build_response_object(model, &resp_id, &msg_id, &text, &calls, oai.get("usage"), "completed");
+        let resp = build_response_object(model, &resp_id, &msg_id, &text, &calls, agg.usage.as_ref(), "completed");
         return Ok(json_res(StatusCode::OK, resp));
     }
 
-    let rx = spawn_responses_stream(upstream_res, model.to_string());
+    let rx = spawn_responses_stream(upstream_res, model.to_string(), injected);
     Ok(sse_response(StatusCode::OK).body(BoxBody::new(StreamBody::new(ReceiverStream::new(rx).map(|res| res.map(Frame::data)))))?)
 }
 
@@ -335,6 +458,7 @@ async fn close_text_block(
 fn spawn_responses_stream(
     upstream_res: Response<hyper::body::Incoming>,
     model: String,
+    injected: Vec<String>,
 ) -> tokio::sync::mpsc::Receiver<Result<Bytes, Err>> {
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, Err>>(256);
     let resp_id = format!("resp_{}", rand_hex(16));
@@ -365,6 +489,7 @@ fn spawn_responses_stream(
         let mut text_acc = String::new();
         // tc index -> (output_index, item_id, call_id, name, args)
         let mut tools: HashMap<i64, (usize, String, String, String, String)> = HashMap::new();
+        let mut dropped: std::collections::HashSet<i64> = std::collections::HashSet::new();
         let mut usage: Option<Value> = None;
 
         while let Some(frame_res) = body.frame().await {
@@ -417,11 +542,18 @@ fn spawn_responses_stream(
                         if let Some(tcs) = &choice.delta.tool_calls {
                             for tc in tcs {
                                 let tci = tc.index.unwrap_or(0);
+                                if dropped.contains(&tci) {
+                                    continue;
+                                }
                                 if let std::collections::hash_map::Entry::Vacant(e) = tools.entry(tci) {
+                                    let name = tc.function.as_ref().and_then(|f| f.name.clone()).unwrap_or_default();
+                                    if injected.contains(&name) {
+                                        dropped.insert(tci);
+                                        continue;
+                                    }
                                     close_text_block(&tx, &mut text_out, &text_item_id, &text_acc).await;
                                     let call_id = tc.id.clone().unwrap_or_else(|| format!("call_{}", rand_hex(16)));
                                     let item_id = format!("fc_{}", rand_hex(12));
-                                    let name = tc.function.as_ref().and_then(|f| f.name.clone()).unwrap_or_default();
                                     let out_idx = next_out;
                                     next_out += 1;
                                     e.insert((out_idx, item_id.clone(), call_id.clone(), name.clone(), String::new()));
